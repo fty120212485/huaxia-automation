@@ -38,6 +38,26 @@ def test_get_video_bytes_preserves_401_status(monkeypatch):
     client.close()
 
 
+def test_exam_mutation_is_not_automatically_retried(monkeypatch):
+    config = load_config({"HXACC_TOKEN": "secret-token", "HXACC_DEVICE_ID": "device-id"})
+    client = HxaccClient(config)
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        raise httpx.ReadTimeout("lost response")
+
+    monkeypatch.setattr(client.client, "post", post)
+    try:
+        with pytest.raises(ApiError, match="需查询服务端状态"):
+            client.post_exam_json("postStartExam", {"examId": "exam"})
+        assert len(calls) == 1
+        assert calls[0][0] == f"{config.exam_base_url}/api/newexam/postStartExam"
+        assert "sid=secret-token" in calls[0][1]["headers"]["Cookie"]
+    finally:
+        client.close()
+
+
 def test_post_learn_json_retries_transient_network_error(monkeypatch):
     config = load_config(
         {

@@ -78,6 +78,26 @@ class HxaccClient:
     def close(self) -> None:
         self.client.close()
 
+    def post_exam_json(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Single attempt: exam mutations must be reconciled before retrying."""
+        path = f"/api/newexam/{method}"
+        try:
+            response = self.client.post(
+                f"{self.config.exam_base_url}{path}",
+                json=payload,
+                headers={**self.learn_headers, "Content-Type": "application/json"},
+            )
+        except httpx.TransportError as exc:
+            raise ApiError(f"考试接口 {method} 网络异常，需查询服务端状态后恢复") from exc
+        self._raise_for_status(response, context=f"POST {path}")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise ApiError(f"考试接口 {method} 返回非 JSON 响应") from exc
+        if not isinstance(result, dict):
+            raise ApiError(f"考试接口 {method} 响应不是对象")
+        return result
+
     def _raise_for_status(
         self,
         response: httpx.Response,

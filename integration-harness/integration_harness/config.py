@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -29,6 +29,19 @@ class Config:
     runs_dir: Path
     ssl_verify: bool
     auto_next_course: bool
+    exam_base_url: str = "https://guangdong.hxacc.com"
+    exam_task_map_json: str = "{}"
+    exam_heartbeat_seconds: int = 20
+    exam_poll_seconds: int = 3
+    exam_poll_attempts: int = 30
+    exam_submit_min_seconds: int = 30
+    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    llm_model: str = "glm-4.7-flash"
+    llm_api_key: str = field(default="", repr=False)
+    llm_timeout_seconds: int = 60
+    llm_retries: int = 3
+    llm_max_tokens: int = 8192
+    llm_max_tokens_limit: int = 32768
 
     @property
     def token_prefix(self) -> str:
@@ -121,4 +134,17 @@ def load_config(overrides: dict[str, str] | None = None) -> Config:
         not in {"0", "false", "no", "off"},
         auto_next_course=values.get("AUTO_NEXT_COURSE", "false").strip().lower()
         in {"1", "true", "yes", "on"},
+        exam_base_url=values.get("EXAM_BASE_URL", "https://guangdong.hxacc.com").rstrip("/"),
+        exam_task_map_json=values.get("EXAM_TASK_MAP_JSON", "{}"),
+        exam_heartbeat_seconds=max(1, int(values.get("EXAM_HEARTBEAT_SECONDS", "20"))),
+        exam_poll_seconds=max(1, int(values.get("EXAM_POLL_SECONDS", "3"))),
+        exam_poll_attempts=max(1, int(values.get("EXAM_POLL_ATTEMPTS", "30"))),
+        exam_submit_min_seconds=max(0, int(values.get("EXAM_SUBMIT_MIN_SECONDS", "30"))),
+        llm_base_url=values.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/"),
+        llm_model=values.get("LLM_MODEL", "glm-4.7-flash"),
+        llm_api_key=values.get("LLM_API_KEY", "").strip(),
+        llm_timeout_seconds=max(1, int(values.get("LLM_TIMEOUT_SECONDS", "60"))),
+        llm_retries=max(1, int(values.get("LLM_RETRIES", "3"))),
+        llm_max_tokens=max(1, int(values.get("LLM_MAX_TOKENS", "8192"))),
+        llm_max_tokens_limit=max(1, int(values.get("LLM_MAX_TOKENS_LIMIT", "32768"))),
     )

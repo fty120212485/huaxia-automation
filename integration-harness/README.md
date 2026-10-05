@@ -174,7 +174,7 @@ hxacc/account/{idCard}/{pointCode}.json
 `pointCode.json` 包含 `task_id`、`created_at`、`expires_at`、`sha256`。
 其中时间使用 `Asia/Shanghai`（`+08:00`），`sha256` 是 PNG 图片字节内容的 SHA-256，用于防止重扫。
 
-每个小节（doc）播放完成后，才通过 `/api/mycert/getTaskCert` 检查课程是否同步完成：匹配 `taskId` 后，`extra.synced=1` 视为已完成；`synced=0` 或缺失则继续定位下一小节观看。本地课程进度 `lp=100` 但只要 `synced != 1`，仍会继续定位 `courseList` 中的课程观看，不会误报“任务已全部看完”。
+任务入口及每个小节（doc）播放完成后，先检查考试分支，再通过 `/api/mycert/getTaskCert` 检查任务是否同步完成：匹配 `taskId` 后，`extra.synced=1` 视为已完成；`synced=0` 或缺失则继续定位下一小节观看。本地课程进度 `lp=100` 但只要 `synced != 1`，仍会继续定位 `courseList` 中的课程观看，不会误报“任务已全部看完”。
 
 认证等待期间不轮询同步状态，认证通过后恢复播放。若认证未通过，等待 30 分钟后会推送企业微信“认证未通过，已停止学习”通知，并在 OSS 写入 `hxacc/account/{idCard}/stop` 停止标记，终止该账户的学习（不影响其他正在学习的学员）。
 
@@ -278,6 +278,17 @@ http://127.0.0.1:8000/qr
 ```
 
 如果浏览器没有自动打开，可手动访问该地址。页面会每 3 秒更新显示，并自动轮询认证结果。
+
+## 正式考试分支
+
+任务入口及每个小节结束后，存在 `taskInfo.examId` 且 `mytaskInfo.examStatus=0` 时触发正式考试状态检查。
+开考及重考前重新确认 `learnedStatus=2`，并要求 `checkStartCondition` 返回 `code=0` 且 `pass=true`；不满足则继续学习。
+支持查询已通过记录、恢复未完成试卷、跳过已答题、等待成绩及服务端允许时的不及格重考。
+考试通过后仍以 `synced` 判断任务完成；`synced=0` 继续原有学习流程。
+
+需配置 `LLM_API_KEY`；无法从任务响应识别考试 ID 时可设置 `EXAM_TASK_MAP_JSON`。
+恢复记录保存在本地及 OSS，配置或认证阻塞沿用 `stop` / `resume`。
+完整配置、接口流程及恢复规则见 [正式考试分支说明](docs/exam-flow.md)。
 
 ## 测试
 

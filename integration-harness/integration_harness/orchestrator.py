@@ -15,6 +15,9 @@ import qrcode
 
 from .client import ApiError, HxaccClient, VideoDownloadError
 from .config import Config
+from .exam import ExamBlocked, ExamDeferred, ExamRunner, resolve_exam_ids
+from .exam_answers import LlmAnswerer
+from .exam_state import ExamStateStore
 from .oss_upload import OssAccountUploader
 from .qr_page import QRPageState, QRServerHandle, start_qr_server
 from .storage import RunStore
@@ -193,6 +196,13 @@ class Orchestrator:
         skipped_course_ids: set[str] = set()
 
         while True:
+            if self._run_exam_if_required(str(task_id), detail):
+                detail = self._get_task_detail(task_id)
+            # Exam pass and task completion are independent. The certificate
+            # endpoint remains the authority for synced, including after exams.
+            if self._is_task_completed(task_id):
+                self._on_task_completed(task, detail)
+                break
             course_id = self._next_unfinished_course_id(
                 detail,
                 exclude=skipped_course_ids,
@@ -210,7 +220,7 @@ class Orchestrator:
                         "任务未同步，但无法从 getTaskCert 或任务配置定位待观看课程：%s",
                         task_id,
                     )
-                    break
+                    raise RuntimeError("任务尚未同步且无法定位课程，保留未完成状态")
 
             try:
                 if forced_watch:
@@ -246,22 +256,59 @@ class Orchestrator:
                     course_list_id=course_list_id,
                     doc_id=doc_id or None,
                 )
-                if self._is_task_completed(task_id):
-                    self.logger.info(
-                        "小节完成后检测到任务已同步完成（synced=1）：%s",
-                        task_id,
-                    )
-                    detail = self._get_task_detail(task_id)
-                    self._on_task_completed(task, detail)
-                    break
                 detail = self._get_task_detail(task_id)
             except _NoUnfinishedLearning as exc:
+                if forced_watch:
+                    raise RuntimeError("任务尚未同步，服务端没有可继续学习的小节") from exc
                 skipped_course_ids.add(course_id)
                 self.logger.info("课程 %s 跳过：%s", course_id, exc)
                 detail = self._get_task_detail(task_id)
 
         self.logger.info("任务已全部看完：%s", title)
         self._set_state("completed")
+
+    def _run_exam_if_required(self, task_id: str, detail: dict[str, Any]) -> bool:
+        mytask = (detail.get("data") or {}).get("mytaskInfo") or {}
+        task_info = (detail.get("data") or {}).get("taskInfo") or {}
+        if not task_info.get("examId") or mytask.get("examStatus") not in (0, "0"):
+            return False
+        self._set_state("exam")
+        try:
+            exam_ids = resolve_exam_ids(detail, task_id, self.config.exam_task_map_json)
+            for exam_id in exam_ids:
+                checkpoint = ExamStateStore(
+                    self.config.runs_dir, self.id_card, task_id, exam_id, self.oss_uploader,
+                )
+                runner = ExamRunner(
+                    config=self.config, api=self.client.post_exam_json,
+                    state_store=checkpoint, answerer=LlmAnswerer(self.config, logger=self.logger),
+                    can_start=lambda: ((self._get_task_detail(task_id).get("data") or {})
+                                       .get("mytaskInfo") or {}).get("learnedStatus") in (2, "2"),
+                    notify=lambda message: self.notifier.send_markdown(
+                        f"学员：{self.name}\n任务：{task_id}\n{message}"
+                    ),
+                )
+                runner.ensure_passed()
+                self._record(
+                    event_type="exam_passed", method="STATE", host=self.config.exam_base_url,
+                    path=f"exam/{exam_id}", status_code=None,
+                    request_payload={"taskId": task_id, "examId": exam_id},
+                    response_summary={key: runner.state.get(key) for key in
+                                      ("mygradeId", "phase", "score", "passedScore")},
+                )
+        except ExamDeferred as exc:
+            self.logger.info("考试暂不具备开考条件：%s", exc)
+            self._set_state("learning")
+            return True
+        except ApiError as exc:
+            if exc.status_code == 401:
+                self._signal_relogin()
+            raise
+        except ExamBlocked:
+            self._mark_account_stopped("exam_blocked")
+            raise
+        self._set_state("learning")
+        return True
 
     def _get_task_detail(self, task_id: str) -> dict[str, Any]:
         return self._post_json(
@@ -623,6 +670,9 @@ class Orchestrator:
             mytask_info = detail.get("data", {}).get("mytaskInfo") or {}
             if mytask_info.get("synced") in (1, "1", True):
                 continue
+            if ((detail.get("data", {}).get("taskInfo") or {}).get("examId")
+                    and mytask_info.get("examStatus") in (0, "0")):
+                return f"{task_info.get('title') or '<未命名任务>'}：检查正式考试状态"
 
             course_id = self._next_unfinished_course_id(detail)
             if not course_id:
