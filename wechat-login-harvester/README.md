@@ -41,6 +41,8 @@ cp .env.example .env
 - `CAPTURE_PORT`
 - `LOGIN_URL_MARKER`
 - `WATCH_INTERVAL_SECONDS`：`watch` 命令的轮询间隔，默认 5 秒
+- `RELOGIN_POLL_INTERVAL_SECONDS`：重新登录信号检查间隔，默认 15 秒，与用户文件检查分开；实际还包含当前采集和网络耗时。
+- `OSS_DIRECTORY_CACHE_SECONDS`：账号目录完整列表的缓存时间，默认 60 秒；新增、删除目录最多额外等待约 60 秒被发现。
 - `LOGIN_LOGOUT_DELAY_SECONDS`：每次登录、登出前等待的秒数，默认 30 秒
 - `WECOM_WEBHOOK_URL`：企业微信机器人 Webhook 地址
 - `WECOM_BOT_ID` / `WECOM_BOT_SECRET`：企业微信智能机器人长连接凭证，用于通过机器人消息增删改查用户
@@ -64,6 +66,8 @@ cp .env.example .env
 学习状态
 停止 身份证:440682198001010011
 恢复 身份证:440682198001010011
+恢复 身份证:440682198001010011,440682198210063620
+恢复学习+440682198001010011,440682198210063620
 自动下一门 身份证:440682198001010011 开关:true
 自动下一门 身份证:440682198001010011 开关:false
 全局自动下一门 开关:true
@@ -81,6 +85,8 @@ cp .env.example .env
 - `学习状态`：列出全部用户的学习状态（学习中 / 未在学习 / 已完成 / 已跳过）。
 - `停止 身份证:xxx`：向 OSS 写入 `hxacc/account/{idCard}/stop` 标记，integration-harness 检测到后停止该学员的学习进程。
 - `恢复 身份证:xxx`：删除上述 `stop` 标记，学习任务重新恢复。
+- `恢复学习+身份证1,身份证2`：批量恢复指定用户，身份证用英文逗号分隔（也支持中文逗号）；重复号码只处理一次，回复列出成功和失败结果。
+- `恢复 身份证：身份证1,身份证2`：同样支持批量恢复，可直接粘贴逗号分隔的身份证列表。
 - `自动下一门 身份证:xxx 开关:true/false`：直接修改对应 `.account` 的 `autoNextCourse`；integration-harness 的 watch 检测到文件变化后会自动重启该账号进程。
 - `全局自动下一门 开关:true/false`：修改 integration-harness `.env` 的 `AUTO_NEXT_COURSE`，integration-harness 的 watch 检测到后重启全部运行中的学习进程。
 - `自动下一门开关`：显示续学开关说明；全局在 integration-harness 的 `.env` 配置 `AUTO_NEXT_COURSE`。
@@ -139,3 +145,11 @@ hxacc/account/{idCard}/account.json
 OSS 凭证需配置在 `.env` 中（`OSS_BUCKET`、`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`OSS_ENDPOINT`）。
 
 上传 OSS 文件时会打印开始/成功/失败日志；失败时同时推送企业微信。登录、登出、抓包代理、OSS 删除等失败操作也会推送企业微信。
+
+## OSS 调用统计与缓存
+
+进程有活动统计时，每分钟最多输出一条 `OSS_STATS` JSON 汇总，退出时补充最后一个窗口。字段包含组件、主机、节点、PID、统计窗口和按操作、用途分组的次数、成功/404/其他错误、正文上传下载字节及耗时；`cache_hits` 单独统计本地缓存复用次数，不是 OSS 请求。不同客户端实例在同一进程内合并计数，不输出对象路径、账号信息、token 或异常原文。短命令和学习子进程退出时也会各自输出汇总。
+
+这是程序发起的 SDK 调用统计，不包含 SDK 内部重试次数、HTTP/XML 开销，也不等同于计费请求数。流量字段统计成功读取的正文和成功提交的上传正文，不等同于账单外网流量；认证程序的调用仍需在对应项目中单独统计。
+
+目录缓存只接收完整成功的分页结果；刷新失败会报错并跳过本轮登录信号处理，不用旧目录伪装成刷新成功，也不把错误当成空目录。所有缓存仅保存在进程内，重启后首次读取会访问 OSS。上述秒数可设为 `0`，目录缓存将关闭，登录信号则恢复为每次 watch 循环检查；负数和非有限值无效。修改配置后重启进程生效。

@@ -294,6 +294,9 @@ def test_watch_accounts_starts_and_stops_child(tmp_path, monkeypatch):
         def object_exists(self, key):
             return False
 
+        def get_optional_text(self, key):
+            return None
+
         def upload_text(self, key, content=""):
             return SimpleNamespace(key=key, success=True, error=None)
 
@@ -373,6 +376,9 @@ def test_watch_accounts_restarts_child_when_account_file_changes(
         def object_exists(self, key):
             return False
 
+        def get_optional_text(self, key):
+            return None
+
         def upload_text(self, key, content=""):
             return SimpleNamespace(key=key, success=True, error=None)
 
@@ -444,3 +450,305 @@ def test_watch_accounts_restarts_child_when_account_file_changes(
     assert len(_FakePopen.instances) == 2
     assert _FakePopen.instances[0].terminated is True
     assert _FakePopen.instances[1].terminated is True
+
+
+@pytest.fixture
+def lease_watch(tmp_path, monkeypatch):
+    from integration_harness import main as main_module
+
+    account = tmp_path / "id.account"
+    account.write_text('{"tokenExpiresAt":4102444800}', encoding="utf-8")
+    clock = [0.0]
+
+    class FakeUploader:
+        process_exists = False
+        process_checks = 0
+        process_reads = 0
+        process_writes = 0
+        stopped = False
+
+        def list_prefixes(self, prefix):
+            return ["hxacc/account/id/"]
+
+        def object_exists(self, key):
+            if key.endswith(".process"):
+                self.process_checks += 1
+                return self.process_exists
+            return self.stopped and key.endswith("/stop")
+
+        def get_optional_text(self, key):
+            if key.endswith(".process"):
+                self.process_reads += 1
+                if not self.process_exists:
+                    return None
+                return '{"worker_id":"other","expires_at":"2100-01-01T00:00:00+00:00"}'
+            if key.endswith("/stop") and self.stopped:
+                return ""
+            return None
+
+        def upload_text(self, key, content=""):
+            assert key.endswith(".process")
+            self.process_exists = True
+            self.process_writes += 1
+            return SimpleNamespace(success=True, error=None)
+
+        def delete_object(self, key):
+            if key.endswith(".process"):
+                self.process_exists = False
+            return SimpleNamespace(success=True, error=None)
+
+    uploader = FakeUploader()
+    monkeypatch.setattr(main_module, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(main_module, "load_config", lambda overrides=None: SimpleNamespace(
+        wecom_webhook_url="https://example.com/hook", runs_dir=tmp_path / "runs",
+        oss_bucket="bucket", oss_access_key_id="key", oss_access_key_secret="secret",
+        oss_endpoint="https://example.com",
+    ))
+    monkeypatch.setattr(main_module, "OssAccountUploader", lambda **kwargs: uploader)
+    monkeypatch.setattr(main_module, "WeChatNotifier", lambda *args, **kwargs: SimpleNamespace(
+        send_markdown=lambda content: True, close=lambda: None,
+    ))
+    monkeypatch.setattr(main_module, "_oss_worker_ids", lambda _, **kwargs: ["test-worker"])
+    monkeypatch.setenv("WORKER_ID", "test-worker")
+    monkeypatch.setenv("PROCESS_LEASE_SECONDS", "120")
+    monkeypatch.setenv("OSS_STOP_POLL_SECONDS", "0")
+    monkeypatch.setenv("OSS_STATUS_POLL_SECONDS", "0")
+    monkeypatch.setenv("OSS_WORKERS_CACHE_SECONDS", "0")
+    monkeypatch.setattr(main_module, "_single_account_command", lambda path: ["fake-run"])
+    monkeypatch.setattr(main_module.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+    _FakePopen.instances.clear()
+    return main_module, uploader, clock, account
+
+
+def test_watch_local_process_skips_remote_lease_reads_but_renews(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    rounds = 0
+
+    def advance(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 3:
+            raise KeyboardInterrupt
+        clock[0] += 61
+
+    monkeypatch.setattr(main_module.time, "sleep", advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert len(_FakePopen.instances) == 1
+    assert uploader.process_checks == 0
+    assert uploader.process_reads == 1  # Only the initial acquisition.
+    assert uploader.process_writes == 3  # Initial lease and two renewals.
+
+
+def test_watch_still_checks_remote_lease_before_starting(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    uploader.process_exists = True
+    rounds = 0
+
+    def advance(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(main_module.time, "sleep", advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert _FakePopen.instances == []
+    assert uploader.process_checks == 0
+    assert uploader.process_reads == 3
+    assert uploader.process_writes == 0
+
+
+@pytest.mark.parametrize("reason", ["stop", "expired", "exit"])
+def test_watch_local_process_still_stops_or_restarts(lease_watch, monkeypatch, reason):
+    main_module, uploader, clock, account = lease_watch
+    rounds = 0
+
+    def change_then_interrupt(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            if reason == "stop":
+                uploader.stopped = True
+            elif reason == "expired":
+                monkeypatch.setattr(main_module, "_token_expired", lambda _: True)
+            else:
+                _FakePopen.instances[0].poll = lambda: 0
+            return
+        if rounds == 2 and reason == "exit":
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main_module.time, "sleep", change_then_interrupt)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert len(_FakePopen.instances) == (2 if reason == "exit" else 1)
+    assert uploader.process_reads == (2 if reason == "exit" else 1)
+    assert _FakePopen.instances[-1].terminated
+
+
+@pytest.mark.parametrize('key_suffix', ['.process', '/daily_limit'])
+def test_watch_does_not_start_account_when_marker_read_fails(lease_watch, monkeypatch, key_suffix):
+    main_module, uploader, clock, account = lease_watch
+    original = uploader.get_optional_text
+    def fail_read(key):
+        if key.endswith(key_suffix):
+            raise TimeoutError('network timeout')
+        return original(key)
+    monkeypatch.setattr(uploader, 'get_optional_text', fail_read)
+    def interrupt(_):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(main_module.time, 'sleep', interrupt)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert _FakePopen.instances == []
+    assert uploader.process_writes == 0
+
+
+def test_watch_uses_independent_status_and_worker_intervals(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    from collections import Counter
+    reads = Counter()
+    original_read = uploader.get_optional_text
+    original_exists = uploader.object_exists
+    def read(key):
+        reads[key.rsplit('/', 1)[-1]] += 1
+        return original_read(key)
+    def exists(key):
+        reads[key.rsplit('/', 1)[-1]] += 1
+        return original_exists(key)
+    def workers(*args, **kwargs):
+        reads['workers'] += 1
+        return ['test-worker']
+    monkeypatch.setattr(uploader, 'get_optional_text', read)
+    monkeypatch.setattr(uploader, 'object_exists', exists)
+    monkeypatch.setattr(main_module, '_oss_worker_ids', workers)
+    monkeypatch.setenv('OSS_STOP_POLL_SECONDS', '10')
+    monkeypatch.setenv('OSS_STATUS_POLL_SECONDS', '60')
+    monkeypatch.setenv('OSS_WORKERS_CACHE_SECONDS', '60')
+    times = iter([2, 4, 10, 12, 60])
+    def advance(_):
+        try:
+            clock[0] = next(times)
+        except StopIteration:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(main_module.time, 'sleep', advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert reads['daily_limit'] == 2
+    assert reads['finished'] == 2
+    assert reads['stop'] == 3
+    assert reads['workers'] == 2
+    assert uploader.process_reads == 1
+    assert uploader.process_writes == 2
+
+
+def test_cached_stop_marker_is_refreshed_for_stop_and_resume(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    monkeypatch.setenv('OSS_STOP_POLL_SECONDS', '10')
+    steps = iter([(2, True), (10, True), (12, False), (20, False)])
+    observed = []
+    def advance(_):
+        observed.append(len(_FakePopen.instances))
+        try:
+            clock[0], uploader.stopped = next(steps)
+        except StopIteration:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(main_module.time, 'sleep', advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert observed == [1, 1, 1, 1, 2]
+    assert _FakePopen.instances[0].terminated
+
+
+def test_child_exit_invalidates_cached_finished_status(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    monkeypatch.setenv('OSS_STATUS_POLL_SECONDS', '60')
+    original_exists = uploader.object_exists
+    finished = [False]
+    def exists(key):
+        return finished[0] if key.endswith('/finished') else original_exists(key)
+    monkeypatch.setattr(uploader, 'object_exists', exists)
+    rounds = 0
+    def change(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            finished[0] = True
+            _FakePopen.instances[0].poll = lambda: 0
+        elif rounds == 3:
+            raise KeyboardInterrupt
+        clock[0] += 2
+    monkeypatch.setattr(main_module.time, 'sleep', change)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert len(_FakePopen.instances) == 1
+
+
+def test_worker_refresh_failure_does_not_stop_local_process_or_prevent_renewal(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    calls = []
+    monkeypatch.setenv('OSS_WORKERS_CACHE_SECONDS', '60')
+    def workers(*args, **kwargs):
+        calls.append(True)
+        if len(calls) > 1:
+            raise TimeoutError('timeout')
+        return ['test-worker']
+    monkeypatch.setattr(main_module, '_oss_worker_ids', workers)
+    rounds = 0
+    def advance(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            clock[0] = 61
+        else:
+            assert not _FakePopen.instances[0].terminated
+            raise KeyboardInterrupt
+    monkeypatch.setattr(main_module.time, 'sleep', advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert uploader.process_writes == 2
+    assert len(_FakePopen.instances) == 1
+
+
+def test_daily_limit_cache_is_refreshed_at_midnight(lease_watch, monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    main_module, uploader, clock, account = lease_watch
+    now = [datetime(2026, 10, 25, 23, 59, 59, tzinfo=timezone(timedelta(hours=8)))]
+    class DateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now[0] if tz is None else now[0].astimezone(tz)
+    monkeypatch.setattr(main_module, 'datetime', DateTime)
+    monkeypatch.setenv('OSS_STATUS_POLL_SECONDS', '60')
+    original_read = uploader.get_optional_text
+    daily_reads = []
+    def read(key):
+        if key.endswith('/daily_limit'):
+            daily_reads.append(True)
+            return '2026-10-25'
+        return original_read(key)
+    monkeypatch.setattr(uploader, 'get_optional_text', read)
+    rounds = 0
+    def advance(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            assert _FakePopen.instances == []
+            now[0] += timedelta(seconds=2)
+            clock[0] += 2
+        else:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(main_module.time, 'sleep', advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert len(daily_reads) == 2
+    assert len(_FakePopen.instances) == 1
+
+
+def test_worker_list_strict_reads_do_not_treat_failures_as_missing():
+    class Reader:
+        def __init__(self, value=None, error=None):
+            self.value, self.error = value, error
+        def get_optional_text(self, key):
+            if self.error:
+                raise self.error
+            return self.value
+    assert _oss_worker_ids(Reader(), strict=True) is None
+    assert _oss_worker_ids(Reader('["worker"]'), strict=True) == ['worker']
+    for reader in (Reader('bad json'), Reader('[]'), Reader(error=TimeoutError('timeout'))):
+        with pytest.raises((ValueError, TimeoutError)):
+            _oss_worker_ids(reader, strict=True)
