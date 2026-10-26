@@ -18,6 +18,10 @@ from .login import LoginRunner
 from .oss import OssClient
 from .reconcile import reconcile
 from .wechat import WeChatNotifier
+from .oss_runtime import STATS, seconds
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_WECOM_WEBHOOK_URL = (
@@ -443,16 +447,21 @@ def _relogin_user(config, user, notifier) -> bool:
 def _poll_relogin_signals(config, oss, notifier) -> None:
     if oss is None:
         return
-    for id_card in _list_account_ids(oss):
+    try:
+        account_ids = _list_account_ids(oss)
+    except Exception as exc:
+        logger.warning("读取账号目录失败（%s），本轮不处理登录信号", type(exc).__name__)
+        return
+    for id_card in account_ids:
         key = _relogin_signal_key(id_card)
-        if not oss.object_exists(key):
+        try:
+            raw = oss.get_optional_text(key)
+        except Exception as exc:
+            logger.warning(
+                "读取重新登录标记失败：%s（%s），下轮重试", key, type(exc).__name__
+            )
             continue
-
-        raw = oss.get_object_text(key)
-        if not raw.strip():
-            # object_exists 与 get_object 之间存在竞态：信号刚被别的进程消费掉，
-            # get_object 会抛 404（NoSuchKey）并被 get_object_text 吞成空串。
-            # 按“无信号”跳过，避免对同一账号重复登录。
+        if raw is None or not raw.strip():
             continue
         attempts = 0
         last_attempt_at = 0.0
@@ -516,7 +525,13 @@ def _command_watch(config, notifier: WeChatNotifier | None) -> int:
         )
 
     last_hash = _user_file_hash(config)
+    last_relogin_poll: float | None = None
+    relogin_interval = seconds("RELOGIN_POLL_INTERVAL_SECONDS", 15)
     print(f"开始监控 {config.user_file}，间隔 {config.watch_interval_seconds}s")
+    print(
+        f"OSS 登录信号检查间隔 {relogin_interval}s，"
+        f"目录缓存 {seconds('OSS_DIRECTORY_CACHE_SECONDS', 60)}s"
+    )
     try:
         while True:
             time.sleep(config.watch_interval_seconds)
@@ -530,7 +545,11 @@ def _command_watch(config, notifier: WeChatNotifier | None) -> int:
                     details={"异常": f"{type(exc).__name__}: {exc}"},
                 )
                 continue
-            _poll_relogin_signals(new_config, oss, notifier)
+            now = time.monotonic()
+            if last_relogin_poll is None or now - last_relogin_poll >= relogin_interval:
+                _poll_relogin_signals(new_config, oss, notifier)
+                last_relogin_poll = time.monotonic()
+            STATS.flush()
             new_hash = _user_file_hash(new_config)
             if new_hash == last_hash:
                 continue
@@ -541,6 +560,7 @@ def _command_watch(config, notifier: WeChatNotifier | None) -> int:
                 _harvest_users(new_config, result.to_harvest, notifier)
             config = new_config
     finally:
+        STATS.flush(force=True)
         stop_event.set()
         if bot_thread is not None:
             bot_thread.join(timeout=3)

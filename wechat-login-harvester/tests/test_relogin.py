@@ -26,6 +26,9 @@ class _FakeOss:
     def get_object_text(self, key):
         return self.signals.get(key, "")
 
+    def get_optional_text(self, key):
+        return self.signals.get(key)
+
     def delete_object(self, key):
         self.deleted.append(key)
         self.signals.pop(key, None)
@@ -166,3 +169,71 @@ def test_poll_relogin_signals_skips_empty_signal(monkeypatch):
 
     assert called == []
     assert "hxacc/account/id-1/relogin" not in oss.deleted
+
+
+def test_relogin_reads_signal_without_existence_probe(monkeypatch):
+    oss = _FakeOss(
+        {"hxacc/account/id-1/relogin": '{"attempts": 0}'},
+        ["hxacc/account/id-1/"],
+    )
+    def unexpected_probe(key):
+        raise AssertionError("Should read signal directly")
+    monkeypatch.setattr(oss, "object_exists", unexpected_probe)
+    monkeypatch.setattr(
+        "wechat_login_harvester.__main__._relogin_user", lambda *args: True
+    )
+    _poll_relogin_signals(_config("id-1"), oss, _FakeNotifier())
+    assert "hxacc/account/id-1/relogin" in oss.deleted
+
+
+def test_relogin_read_failure_is_reported_without_consuming_signal(monkeypatch, caplog):
+    oss = _FakeOss(
+        {"hxacc/account/id-1/relogin": '{"attempts": 0}'},
+        ["hxacc/account/id-1/"],
+    )
+    def fail_read(key):
+        raise TimeoutError("network timeout")
+    monkeypatch.setattr(oss, "get_optional_text", fail_read)
+    called = []
+    monkeypatch.setattr(
+        "wechat_login_harvester.__main__._relogin_user", lambda *args: called.append(True)
+    )
+    _poll_relogin_signals(_config("id-1"), oss, _FakeNotifier())
+    assert called == []
+    assert oss.deleted == []
+    assert oss.uploads == []
+    assert "TimeoutError" in caplog.text
+
+
+def test_failed_directory_listing_does_not_process_signals(monkeypatch, caplog):
+    oss = _FakeOss({'hxacc/account/id-1/relogin': '{"attempts":0}'}, [])
+    def fail_listing(prefix):
+        raise TimeoutError('timeout')
+    monkeypatch.setattr(oss, 'list_prefixes', fail_listing)
+    _poll_relogin_signals(_config('id-1'), oss, _FakeNotifier())
+    assert oss.deleted == []
+    assert oss.uploads == []
+    assert '读取账号目录失败' in caplog.text
+
+
+def test_watch_polls_login_signals_independently_of_user_file_checks(tmp_path, monkeypatch):
+    import pytest
+    from wechat_login_harvester import __main__ as main
+    config = SimpleNamespace(user_file=tmp_path / 'user', watch_interval_seconds=5,
+                             wecom_bot_id='', wecom_bot_secret='')
+    now = [0]
+    polls = []
+    monkeypatch.setenv('RELOGIN_POLL_INTERVAL_SECONDS', '15')
+    monkeypatch.setattr(main, '_make_oss_client', lambda config: None)
+    monkeypatch.setattr(main, '_user_file_hash', lambda config: 'unchanged')
+    monkeypatch.setattr(main, 'load_config', lambda: config)
+    monkeypatch.setattr(main, '_poll_relogin_signals', lambda *args: polls.append(now[0]))
+    monkeypatch.setattr(main.time, 'monotonic', lambda: now[0])
+    def advance(_):
+        now[0] += 5
+        if now[0] >= 40:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(main.time, 'sleep', advance)
+    with pytest.raises(KeyboardInterrupt):
+        main._command_watch(config, None)
+    assert polls == [5, 20, 35]

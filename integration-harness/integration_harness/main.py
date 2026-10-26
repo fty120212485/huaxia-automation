@@ -18,6 +18,7 @@ from .accounts import Account, AccountLoadError, load_account_file, load_account
 from .client import ApiError, HxaccClient
 from .config import Config, load_config
 from .oss_upload import OssAccountUploader
+from .oss_runtime import ReadCache, STATS, seconds
 from .orchestrator import Orchestrator, _TaskCompletedAwaitResume
 from .storage import RunStore
 from .wechat import WeChatNotifier
@@ -528,19 +529,23 @@ def _daily_limit_key(id_card: str) -> str:
 WORKERS_KEY = "hxacc/workers"
 
 
-def _oss_worker_ids(uploader: OssAccountUploader) -> list[str] | None:
+def _oss_worker_ids(uploader: OssAccountUploader, *, strict=False) -> list[str] | None:
     try:
-        raw = uploader.get_object_text(WORKERS_KEY).strip()
+        raw = (uploader.get_optional_text(WORKERS_KEY) if strict
+               else uploader.get_object_text(WORKERS_KEY))
+        if raw is None:
+            return None
+        data = json.loads(raw.strip())
+        if not isinstance(data, list):
+            raise ValueError("节点名单必须为列表")
+        ids = sorted({str(item).strip() for item in data if str(item).strip()})
+        if not ids:
+            raise ValueError("节点名单不能为空")
+        return ids
     except Exception:
+        if strict:
+            raise
         return None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, list):
-        return None
-    ids = sorted({str(item).strip() for item in data if str(item).strip()})
-    return ids or None
 
 
 def _stop_watched_process(
@@ -591,9 +596,18 @@ def _watch_accounts(account_dir: Path) -> int:
     expired_notified: set[str] = set()
     process_ttl_seconds = int(os.getenv("PROCESS_LEASE_SECONDS", "120"))
     last_renew: dict[str, float] = {}
+    status_reads = ReadCache()
+    worker_reads = ReadCache()
+    stop_interval = seconds("OSS_STOP_POLL_SECONDS", 10)
+    status_interval = seconds("OSS_STATUS_POLL_SECONDS", 60)
+    worker_interval = seconds("OSS_WORKERS_CACHE_SECONDS", 60)
     global_env_path = _project_root() / ".env"
     last_global_auto_next = getattr(config, "auto_next_course", False)
     print(f"开始监控 OSS hxacc/account/，本地账户目录 {account_dir}，扫描间隔 {interval}s")
+    print(
+        f"OSS 缓存：停止 {stop_interval}s，完成/每日上限 {status_interval}s，"
+        f"节点 {worker_interval}s，目录 {seconds('OSS_DIRECTORY_CACHE_SECONDS', 60)}s"
+    )
 
     def process_key(id_card: str) -> str:
         return f"hxacc/account/{id_card}/{id_card}.process"
@@ -603,21 +617,29 @@ def _watch_accounts(account_dir: Path) -> int:
 
     def daily_limit_date(id_card: str) -> str | None:
         key = _daily_limit_key(id_card)
-        if not uploader.object_exists(key):
-            return None
-        try:
-            return uploader.get_object_text(key).strip()
-        except Exception:
-            return ""
+        content = status_reads.get(
+            key, status_interval, lambda: uploader.get_optional_text(key),
+            version=datetime.now().astimezone().date(),
+        )
+        return content.strip() if content is not None else None
 
     def stop_reason(id_card: str) -> str | None:
         key = stop_key(id_card)
-        if not uploader.object_exists(key):
-            return None
-        try:
-            return uploader.get_object_text(key).strip()
-        except Exception:
-            return ""
+        content = status_reads.get(key, stop_interval, lambda: uploader.get_optional_text(key))
+        return content.strip() if content is not None else None
+
+    def delete_status_marker(key: str):
+        result = uploader.delete_object(key)
+        if result.success:
+            status_reads.invalidate(key)
+        return result
+
+    def cleanup_idle_process(id_card: str) -> None:
+        def cleanup():
+            if uploader.object_exists(process_key(id_card)):
+                if not delete_process_file(id_card):
+                    raise RuntimeError("清理空闲账号的进程标记失败")
+        status_reads.get((id_card, "cleanup"), status_interval, cleanup)
 
     def notify_process_file_failure(action: str, key: str, error: str) -> None:
         notifier.send_markdown(
@@ -666,14 +688,16 @@ def _watch_accounts(account_dir: Path) -> int:
         print(f"已删除进程标记：{key}")
         return True
 
-    def process_is_active(id_card: str) -> bool:
+    def process_is_active(id_card: str) -> bool | None:
         key = process_key(id_card)
+        content = uploader.get_optional_text(key)
+        if content is None:
+            return None
         try:
-            content = uploader.get_object_text(key)
             payload = json.loads(content)
             expires_at = payload.get("expires_at")
             expires_timestamp = datetime.fromisoformat(expires_at).timestamp()
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             return False
         return datetime.now(timezone.utc).timestamp() < expires_timestamp
 
@@ -720,8 +744,11 @@ def _watch_accounts(account_dir: Path) -> int:
         consecutive_oss_failures = 0
         while True:
             try:
-                # 每轮从 OSS 重读节点名单，实现扩缩容热加载；读不到沿用上一轮结果。
-                remote_ids = _oss_worker_ids(uploader)
+                # 仅成功读取或明确不存在时缓存；读取失败中止本轮，避免误用空名单。
+                remote_ids = worker_reads.get(
+                    WORKERS_KEY, worker_interval,
+                    lambda: _oss_worker_ids(uploader, strict=True),
+                )
                 if remote_ids is not None:
                     active_worker_ids = remote_ids
                 elif not active_worker_ids:
@@ -768,22 +795,26 @@ def _watch_accounts(account_dir: Path) -> int:
                         if limit_date == today:
                             if id_card in watched:
                                 stop_one(id_card)
-                            elif uploader.object_exists(process_key(id_card)):
-                                delete_process_file(id_card)
+                            else:
+                                cleanup_idle_process(id_card)
                             continue
-                        if not uploader.delete_object(_daily_limit_key(id_card)).success:
+                        if not delete_status_marker(_daily_limit_key(id_card)).success:
                             print(
                                 f"删除过期每日上限标记失败：{_daily_limit_key(id_card)}",
                                 file=sys.stderr,
                             )
                         if uploader.object_exists(stop_key(id_card)):
-                            uploader.delete_object(stop_key(id_card))
+                            delete_status_marker(stop_key(id_card))
 
-                    if uploader.object_exists(f"{prefix}finished"):
+                    finished_key = f"{prefix}finished"
+                    if status_reads.get(
+                        finished_key, status_interval,
+                        lambda: uploader.object_exists(finished_key),
+                    ):
                         if id_card in watched:
                             stop_one(id_card)
-                        elif uploader.object_exists(process_key(id_card)):
-                            delete_process_file(id_card)
+                        else:
+                            cleanup_idle_process(id_card)
                         if id_card not in finished_notified:
                             notifier.send_markdown(
                                 "\n".join(
@@ -797,13 +828,14 @@ def _watch_accounts(account_dir: Path) -> int:
                             finished_notified.add(id_card)
                         continue
 
-                    if uploader.object_exists(stop_key(id_card)):
+                    stopped = stop_reason(id_card)
+                    if stopped is not None:
                         if id_card in watched:
                             stop_one(id_card)
-                        elif uploader.object_exists(process_key(id_card)):
-                            delete_process_file(id_card)
+                        else:
+                            cleanup_idle_process(id_card)
                         if (
-                            stop_reason(id_card) != "task_completed"
+                            stopped != "task_completed"
                             and id_card not in stop_notified
                         ):
                             notifier.send_markdown(
@@ -840,13 +872,15 @@ def _watch_accounts(account_dir: Path) -> int:
 
                     # 本机已管理的进程由 watched 跟踪，并在本轮末尾续期和回收。
                     # 仅准备启动/接管账号时读取远端租约，避免每轮重复读取自己的标记。
-                    if id_card not in watched and uploader.object_exists(process_key(id_card)):
-                        if process_is_active(id_card):
+                    if id_card not in watched:
+                        lease_active = process_is_active(id_card)
+                        if lease_active:
                             print(f"跳过账户 {id_card}：{id_card}.process 租约有效")
                             continue
-                        print(f"清理过期进程标记：{process_key(id_card)}")
-                        if not delete_process_file(id_card):
-                            continue
+                        if lease_active is False:
+                            print(f"清理过期进程标记：{process_key(id_card)}")
+                            if not delete_process_file(id_card):
+                                continue
 
                     expired = _token_expired(account_path)
                     if expired:
@@ -884,18 +918,6 @@ def _watch_accounts(account_dir: Path) -> int:
                     if id_card not in current_ids:
                         stop_one(id_card)
 
-                for id_card in list(watched):
-                    renew_process_file(id_card)
-
-                for id_card, (proc, stdout_file, stderr_file) in list(watched.items()):
-                    if proc.poll() is None:
-                        continue
-                    delete_process_file(id_card)
-                    last_renew.pop(id_card, None)
-                    stdout_file.close()
-                    stderr_file.close()
-                    watched.pop(id_card, None)
-                    print(f"已结束：{id_card}")
             except Exception as exc:
                 consecutive_oss_failures += 1
                 print(
@@ -917,11 +939,31 @@ def _watch_accounts(account_dir: Path) -> int:
             else:
                 consecutive_oss_failures = 0
 
+            # 元数据扫描失败时仍维护已启动的本机进程，避免租约仅因 LIST/GET 故障过期。
+            try:
+                for id_card, (proc, stdout_file, stderr_file) in list(watched.items()):
+                    if proc.poll() is None:
+                        renew_process_file(id_card)
+                        continue
+                    delete_process_file(id_card)
+                    last_renew.pop(id_card, None)
+                    stdout_file.close()
+                    stderr_file.close()
+                    watched.pop(id_card, None)
+                    # 子进程可能刚发布 finished/stop/daily_limit，启动前立即重新确认。
+                    for suffix in ("finished", "stop", "daily_limit"):
+                        status_reads.invalidate(f"hxacc/account/{id_card}/{suffix}")
+                    status_reads.invalidate((id_card, "cleanup"))
+                    print(f"已结束：{id_card}")
+            except Exception as exc:
+                print(f"本机进程租约维护失败：{type(exc).__name__}", file=sys.stderr)
+            STATS.flush()
             time.sleep(interval)
     except KeyboardInterrupt:
         stop_all()
         return 0
     finally:
+        STATS.flush(force=True)
         notifier.close()
 
 
