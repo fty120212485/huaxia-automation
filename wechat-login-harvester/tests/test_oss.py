@@ -1,6 +1,52 @@
 import logging
+from types import SimpleNamespace
+
+import pytest
 
 from wechat_login_harvester.oss import OssClient
+
+
+def test_list_prefixes_reads_all_pages():
+    calls = []
+
+    class PaginatedBucket:
+        def list_objects(self, **kwargs):
+            calls.append(kwargs)
+            if kwargs["marker"] == "":
+                return SimpleNamespace(
+                    prefix_list=["hxacc/account/first/"],
+                    is_truncated=True,
+                    next_marker="page-2",
+                )
+            assert kwargs["marker"] == "page-2"
+            return SimpleNamespace(
+                prefix_list=[SimpleNamespace(prefix="hxacc/account/last/")],
+                is_truncated=False,
+            )
+
+    oss = OssClient.__new__(OssClient)
+    oss.bucket = PaginatedBucket()
+    assert oss.list_prefixes("hxacc/account/") == [
+        "hxacc/account/first/", "hxacc/account/last/"
+    ]
+    assert calls == [
+        {"prefix": "hxacc/account/", "delimiter": "/", "marker": ""},
+        {"prefix": "hxacc/account/", "delimiter": "/", "marker": "page-2"},
+    ]
+
+
+@pytest.mark.parametrize("fail_with_exception", [True, False])
+def test_list_prefixes_reports_failed_or_stuck_pagination(caplog, fail_with_exception):
+    class BrokenBucket:
+        def list_objects(self, **kwargs):
+            if fail_with_exception:
+                raise RuntimeError("network failure")
+            return SimpleNamespace(prefix_list=[], is_truncated=True, next_marker="")
+
+    oss = OssClient.__new__(OssClient)
+    oss.bucket = BrokenBucket()
+    assert oss.list_prefixes("hxacc/account/") == []
+    assert "OSS 列举目录失败" in caplog.text
 
 
 class FakeBucket:

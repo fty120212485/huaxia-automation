@@ -444,3 +444,130 @@ def test_watch_accounts_restarts_child_when_account_file_changes(
     assert len(_FakePopen.instances) == 2
     assert _FakePopen.instances[0].terminated is True
     assert _FakePopen.instances[1].terminated is True
+
+
+@pytest.fixture
+def lease_watch(tmp_path, monkeypatch):
+    from integration_harness import main as main_module
+
+    account = tmp_path / "id.account"
+    account.write_text('{"tokenExpiresAt":4102444800}', encoding="utf-8")
+    clock = [0.0]
+
+    class FakeUploader:
+        process_exists = False
+        process_checks = 0
+        process_reads = 0
+        process_writes = 0
+        stopped = False
+
+        def list_prefixes(self, prefix):
+            return ["hxacc/account/id/"]
+
+        def object_exists(self, key):
+            if key.endswith(".process"):
+                self.process_checks += 1
+                return self.process_exists
+            return self.stopped and key.endswith("/stop")
+
+        def get_object_text(self, key):
+            if key.endswith(".process"):
+                self.process_reads += 1
+                return '{"worker_id":"other","expires_at":"2100-01-01T00:00:00+00:00"}'
+            return ""
+
+        def upload_text(self, key, content=""):
+            assert key.endswith(".process")
+            self.process_exists = True
+            self.process_writes += 1
+            return SimpleNamespace(success=True, error=None)
+
+        def delete_object(self, key):
+            if key.endswith(".process"):
+                self.process_exists = False
+            return SimpleNamespace(success=True, error=None)
+
+    uploader = FakeUploader()
+    monkeypatch.setattr(main_module, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(main_module, "load_config", lambda overrides=None: SimpleNamespace(
+        wecom_webhook_url="https://example.com/hook", runs_dir=tmp_path / "runs",
+        oss_bucket="bucket", oss_access_key_id="key", oss_access_key_secret="secret",
+        oss_endpoint="https://example.com",
+    ))
+    monkeypatch.setattr(main_module, "OssAccountUploader", lambda **kwargs: uploader)
+    monkeypatch.setattr(main_module, "WeChatNotifier", lambda *args, **kwargs: SimpleNamespace(
+        send_markdown=lambda content: True, close=lambda: None,
+    ))
+    monkeypatch.setattr(main_module, "_oss_worker_ids", lambda _: ["test-worker"])
+    monkeypatch.setenv("WORKER_ID", "test-worker")
+    monkeypatch.setenv("PROCESS_LEASE_SECONDS", "120")
+    monkeypatch.setattr(main_module, "_single_account_command", lambda path: ["fake-run"])
+    monkeypatch.setattr(main_module.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: clock[0])
+    _FakePopen.instances.clear()
+    return main_module, uploader, clock, account
+
+
+def test_watch_local_process_skips_remote_lease_reads_but_renews(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    rounds = 0
+
+    def advance(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 3:
+            raise KeyboardInterrupt
+        clock[0] += 61
+
+    monkeypatch.setattr(main_module.time, "sleep", advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert len(_FakePopen.instances) == 1
+    assert uploader.process_checks == 1  # Only the initial acquisition.
+    assert uploader.process_reads == 0
+    assert uploader.process_writes == 3  # Initial lease and two renewals.
+
+
+def test_watch_still_checks_remote_lease_before_starting(lease_watch, monkeypatch):
+    main_module, uploader, clock, account = lease_watch
+    uploader.process_exists = True
+    rounds = 0
+
+    def advance(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(main_module.time, "sleep", advance)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert _FakePopen.instances == []
+    assert uploader.process_checks == 3
+    assert uploader.process_reads == 3
+    assert uploader.process_writes == 0
+
+
+@pytest.mark.parametrize("reason", ["stop", "expired", "exit"])
+def test_watch_local_process_still_stops_or_restarts(lease_watch, monkeypatch, reason):
+    main_module, uploader, clock, account = lease_watch
+    rounds = 0
+
+    def change_then_interrupt(_):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            if reason == "stop":
+                uploader.stopped = True
+            elif reason == "expired":
+                monkeypatch.setattr(main_module, "_token_expired", lambda _: True)
+            else:
+                _FakePopen.instances[0].poll = lambda: 0
+            return
+        if rounds == 2 and reason == "exit":
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main_module.time, "sleep", change_then_interrupt)
+    assert main_module._watch_accounts(account.parent) == 0
+    assert len(_FakePopen.instances) == (2 if reason == "exit" else 1)
+    assert uploader.process_reads == 0
+    assert _FakePopen.instances[-1].terminated

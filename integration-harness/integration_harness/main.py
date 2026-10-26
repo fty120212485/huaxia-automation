@@ -668,8 +668,6 @@ def _watch_accounts(account_dir: Path) -> int:
 
     def process_is_active(id_card: str) -> bool:
         key = process_key(id_card)
-        if not uploader.object_exists(key):
-            return False
         try:
             content = uploader.get_object_text(key)
             payload = json.loads(content)
@@ -840,7 +838,9 @@ def _watch_accounts(account_dir: Path) -> int:
                         stop_one(id_card)
                     account_signatures[id_card] = signature
 
-                    if uploader.object_exists(process_key(id_card)):
+                    # 本机已管理的进程由 watched 跟踪，并在本轮末尾续期和回收。
+                    # 仅准备启动/接管账号时读取远端租约，避免每轮重复读取自己的标记。
+                    if id_card not in watched and uploader.object_exists(process_key(id_card)):
                         if process_is_active(id_card):
                             print(f"跳过账户 {id_card}：{id_card}.process 租约有效")
                             continue

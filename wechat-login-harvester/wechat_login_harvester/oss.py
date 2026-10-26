@@ -70,12 +70,24 @@ class OssClient:
 
     def list_prefixes(self, prefix: str) -> list[str]:
         try:
-            result = self.bucket.list_objects(prefix=prefix, delimiter="/")
-            return [
-                item if isinstance(item, str) else item.prefix
-                for item in result.prefix_list
-            ]
+            prefixes: list[str] = []
+            marker = ""
+            while True:
+                result = self.bucket.list_objects(
+                    prefix=prefix, delimiter="/", marker=marker
+                )
+                prefixes.extend(
+                    item if isinstance(item, str) else item.prefix
+                    for item in result.prefix_list
+                )
+                if not result.is_truncated:
+                    return prefixes
+                next_marker = result.next_marker
+                if not next_marker or next_marker == marker:
+                    raise RuntimeError("OSS 目录分页未返回有效的下一页标记")
+                marker = next_marker
         except Exception:
+            logger.exception("OSS 列举目录失败：%s", prefix)
             return []
 
     def get_object_text(self, key: str) -> str:

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from wechat_login_harvester import bot as bot_module
 from wechat_login_harvester.bot import (
     UserStore,
@@ -173,3 +175,57 @@ def test_stop_command_rejects_unknown_user(tmp_path):
     store.write([{"name": "张三", "id_card": "id-1"}])
     reply = handle_text(store, "停止 身份证:unknown", FakeOss())
     assert "未找到身份证" in reply
+
+
+@pytest.mark.parametrize("text", [
+    "恢复学习 + id-1， id-2,id-1",
+    "恢复 身份证：id-1,id-2,id-1",
+    "恢复 身份证：id-1， id-2,\nid-1",
+])
+def test_batch_resume_normalizes_and_deduplicates_ids(tmp_path, text):
+    store = UserStore(tmp_path / "user")
+    store.write([
+        {"name": "张三", "id_card": "id-1"},
+        {"name": "李四", "id_card": "id-2"},
+    ])
+    oss = FakeOss()
+    reply = handle_text(store, text, oss)
+    assert oss.deletes == [_stop_key("id-1"), _stop_key("id-2")]
+    assert "已发送恢复指令 2 个" in reply
+    assert "失败" not in reply
+
+
+@pytest.mark.parametrize("text", ["恢复学习+", "恢复学习+id-1,", "恢复学习+id-1,,id-2", "恢复学习+id-1 id-2", "恢复 身份证：id-1,", "恢复 身份证：id-1,,id-2"])
+def test_batch_resume_rejects_malformed_list_without_changes(tmp_path, text):
+    oss = FakeOss()
+    reply = handle_text(UserStore(tmp_path / "user"), text, oss)
+    assert "用逗号分隔" in reply
+    assert oss.deletes == []
+
+
+def test_batch_resume_continues_after_unknown_user_and_oss_failures(tmp_path):
+    store = UserStore(tmp_path / "user")
+    store.write([{"name": "用户", "id_card": f"id-{n}"} for n in range(1, 5)])
+
+    class PartialOss(FakeOss):
+        def delete_object(self, key):
+            self.deletes.append(key)
+            if key == _stop_key("id-1"):
+                return False
+            if key == _stop_key("id-2"):
+                raise RuntimeError("network error")
+            return True
+
+    oss = PartialOss()
+    reply = handle_text(store, "恢复学习+id-1,unknown,id-2,id-3,id-4", oss)
+    assert oss.deletes == [_stop_key(f"id-{n}") for n in range(1, 5)]
+    assert "已发送恢复指令 2 个" in reply
+    assert "失败 3 个" in reply
+    assert "unknown：未找到用户" in reply
+    assert "id-1：删除停止标记失败" in reply
+    assert "id-2：network error" in reply
+
+
+def test_batch_resume_requires_oss(tmp_path):
+    reply = handle_text(UserStore(tmp_path / "user"), "恢复学习+id-1,id-2")
+    assert reply == "未配置 OSS，无法恢复学习"

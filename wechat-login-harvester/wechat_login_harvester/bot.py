@@ -87,6 +87,8 @@ def _help_text() -> str:
         "学习状态\n"
         "停止 身份证:440682198001010011\n"
         "恢复 身份证:440682198001010011\n"
+        "恢复 身份证:440682198001010011,440682198210063620\n"
+        "恢复学习+440682198001010011,440682198210063620\n"
         "停止所有\n"
         "恢复所有\n"
         "自动下一门 身份证:440682198001010011 开关:true\n"
@@ -102,6 +104,26 @@ def parse_command(text: str) -> ParsedCommand:
     """Parse a text message into a user-operation command."""
     normalized = _normalize(text)
     lowered = normalized.lower()
+
+    resume_list = re.fullmatch(
+        r"(?:恢复|恢复学习|继续|resume)\s+(?:身份证|id_card|idcard|id)\s*:\s*(.*)",
+        normalized,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if resume_list and "," in resume_list.group(1):
+        return parse_command("恢复学习+" + resume_list.group(1))
+
+    batch_resume = re.fullmatch(r"恢复学习\s*\+\s*(.*)", normalized, re.DOTALL)
+    if batch_resume:
+        ids = [item.strip() for item in batch_resume.group(1).split(",")]
+        if any(not item or re.search(r"\s", item) for item in ids):
+            return ParsedCommand(
+                action="resume_batch",
+                error="批量恢复需要提供身份证并用逗号分隔，例如：恢复学习+440682198001010011,440682198210063620",
+            )
+        return ParsedCommand(
+            action="resume_batch", values={"id_cards": list(dict.fromkeys(ids))}
+        )
 
     for keyword, action in (
         ("新增", "add"),
@@ -459,6 +481,30 @@ def handle_text(
             except Exception as exc:
                 return f"停止指令写入失败：{type(exc).__name__}: {exc}"
             return f"已发送停止指令：{command.target_id}，学习任务将被停止"
+        if command.action == "resume_batch":
+            if oss is None:
+                return "未配置 OSS，无法恢复学习"
+            known_ids = {str(user.get("id_card", "")).strip() for user in store.read()}
+            succeeded = []
+            failed = []
+            for id_card in command.values["id_cards"]:
+                if id_card not in known_ids:
+                    failed.append(f"{id_card}：未找到用户")
+                    continue
+                try:
+                    if oss.delete_object(_stop_key(id_card)) is False:
+                        failed.append(f"{id_card}：删除停止标记失败")
+                        continue
+                except Exception as exc:
+                    failed.append(f"{id_card}：{exc}")
+                    continue
+                succeeded.append(id_card)
+            reply = f"批量恢复：已发送恢复指令 {len(succeeded)} 个"
+            if succeeded:
+                reply += "\n" + ",".join(succeeded) + "\n学习任务将恢复"
+            if failed:
+                reply += f"\n失败 {len(failed)} 个：" + "；".join(failed)
+            return reply
         if command.action == "resume":
             if oss is None:
                 return "未配置 OSS，无法恢复学习"
