@@ -39,12 +39,38 @@ def purpose(key: str) -> str:
     return "other"
 
 
+def _byte_label(size: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f}B" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+
+
+def format_report(report: dict) -> str:
+    if os.getenv("OSS_STATS_FORMAT", "summary").strip().lower() == "json":
+        return "OSS_STATS " + json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    rows = report["operations"]
+    totals = {field: sum(row[field] for row in rows) for field in (
+        "count", "success", "404", "errors", "downloaded_bytes", "uploaded_bytes",
+    )}
+    component = {"integration_harness": "学习", "wechat_login_harvester": "采集"}.get(
+        report["component"], report["component"]
+    )
+    node = " ".join(str(report["worker"] or report["host"]).split())
+    return (
+        f"OSS_STATS [{component}/{node} pid={report['pid']}] "
+        f"{report['window_seconds']:.1f}秒 请求{totals['count']} "
+        f"成功{totals['success']} 未找到{totals['404']} 异常{totals['errors']} "
+        f"缓存命中{sum(report['cache_hits'].values())} "
+        f"下行{_byte_label(totals['downloaded_bytes'])} 上行{_byte_label(totals['uploaded_bytes'])}"
+    )
+
+
 class CallStats:
     def __init__(self, component: str, *, clock=None, emit=None, interval=60.0):
         self.component = component
         self.clock = clock or time.monotonic
-        self.emit = emit or (lambda report: print(
-            "OSS_STATS " + json.dumps(report, ensure_ascii=False), flush=True))
+        self.emit = emit or (lambda report: print(format_report(report), flush=True))
         self.interval = interval
         self.lock = threading.Lock()
         self.started = self.clock()

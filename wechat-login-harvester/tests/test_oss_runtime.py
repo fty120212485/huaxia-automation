@@ -91,3 +91,43 @@ def test_invalid_intervals_rejected(monkeypatch, value):
     monkeypatch.setenv('TEST_INTERVAL', value)
     with pytest.raises(ValueError):
         seconds('TEST_INTERVAL', 60)
+
+
+def test_default_output_is_one_short_summary_and_preserves_full_report(monkeypatch, capsys):
+    monkeypatch.delenv('OSS_STATS_FORMAT', raising=False)
+    clock = [0.0]
+    stats = CallStats('integration_harness', clock=lambda: clock[0])
+    stats.call('GET', 'hxacc/account/private-id/account.json', lambda: b'abc')
+    stats.call('EXISTS', 'hxacc/account/private-id/stop', lambda: False)
+    stats.call('PUT', 'hxacc/account/private-id/id.process', lambda: None, uploaded=1024)
+    stats.cache_hit('hxacc/account/private-id/stop')
+    clock[0] = 61.841
+    report = stats.flush()
+    output = capsys.readouterr().out
+    assert len(output.splitlines()) == 1
+    assert len(output) < 250
+    assert '61.8秒 请求3 成功2 未找到1 异常0 缓存命中1 下行3B 上行1.0KiB' in output
+    assert '学习/' in output
+    assert 'private-id' not in output
+    assert 'duration_ms' not in output and 'status_classes' not in output
+    assert len(report['operations']) == 3
+
+
+def test_json_output_remains_available(monkeypatch, capsys):
+    import json
+    monkeypatch.setenv('OSS_STATS_FORMAT', 'json')
+    stats = CallStats('test')
+    stats.call('GET', 'marker', lambda: b'x')
+    report = stats.flush(force=True)
+    output = capsys.readouterr().out
+    assert output.startswith('OSS_STATS {')
+    assert json.loads(output.removeprefix('OSS_STATS ')) == report
+
+
+def test_cache_only_window_has_zero_requests_in_summary(monkeypatch, capsys):
+    monkeypatch.setenv('OSS_STATS_FORMAT', 'summary')
+    stats = CallStats('test')
+    stats.cache_hit('hxacc/workers')
+    stats.flush(force=True)
+    output = capsys.readouterr().out
+    assert '请求0 成功0 未找到0 异常0 缓存命中1 下行0B 上行0B' in output
