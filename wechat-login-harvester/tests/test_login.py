@@ -72,25 +72,21 @@ def test_login_ui_ready_requires_all_bottom_markers():
     assert LoginRunner._looks_logged_in(["首页"]) is False
 
 
-def test_capture_window_retries_transient_window_read_failure(tmp_path, monkeypatch):
-    import Quartz
+def test_capture_window_retries_transient_screencapture_failure(tmp_path, monkeypatch):
+    import subprocess
 
     import wechat_login_harvester.ui as ui_module
 
     calls = []
 
-    def fake_create_image(region, option, window_id, image_option):
-        calls.append(window_id)
+    def fake_run(cmd, *, check, capture_output, text):
+        calls.append(cmd)
         if len(calls) == 1:
-            return None
-        return object()
+            raise subprocess.CalledProcessError(1, cmd, stderr="locked screen\n")
+        (tmp_path / "out.png").write_bytes(b"png")
+        return 0
 
-    monkeypatch.setattr(Quartz, "CGWindowListCreateImage", fake_create_image)
-    monkeypatch.setattr(
-        ui_module,
-        "_save_scaled_image",
-        lambda image, path: path.write_bytes(b"png"),
-    )
+    monkeypatch.setattr(ui_module.subprocess, "run", fake_run)
     monkeypatch.setattr(ui_module.time, "sleep", lambda _: None)
     window = ui_module.MiniProgramWindow(
         window_id=1,
@@ -105,16 +101,15 @@ def test_capture_window_retries_transient_window_read_failure(tmp_path, monkeypa
     assert len(calls) == 2
 
 
-def test_capture_window_surfaces_error_after_retries(tmp_path, monkeypatch):
-    import Quartz
-    import pytest
+def test_capture_window_surfaces_stderr_after_retries(tmp_path, monkeypatch):
+    import subprocess
 
     import wechat_login_harvester.ui as ui_module
 
-    def fake_create_image(region, option, window_id, image_option):
-        return None
+    def fake_run(cmd, *, check, capture_output, text):
+        raise subprocess.CalledProcessError(1, cmd, stderr="no screen permission\n")
 
-    monkeypatch.setattr(Quartz, "CGWindowListCreateImage", fake_create_image)
+    monkeypatch.setattr(ui_module.subprocess, "run", fake_run)
     monkeypatch.setattr(ui_module.time, "sleep", lambda _: None)
     window = ui_module.MiniProgramWindow(
         window_id=1,
@@ -123,7 +118,9 @@ def test_capture_window_surfaces_error_after_retries(tmp_path, monkeypatch):
         bounds=ui_module.WindowBounds(527, 73, 414, 780),
     )
 
-    with pytest.raises(RuntimeError, match="窗口 1 不可读"):
+    import pytest
+
+    with pytest.raises(RuntimeError, match="no screen permission"):
         ui_module.capture_window(window, tmp_path / "out.png")
 
 
