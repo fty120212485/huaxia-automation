@@ -742,7 +742,7 @@ def test_post_json_signals_relogin_on_401():
         )
     )
     signaled: list[bool] = []
-    orchestrator._signal_relogin = lambda: signaled.append(True)
+    orchestrator._signal_relogin = lambda exc, context: signaled.append(True)
 
     with pytest.raises(ApiError):
         orchestrator._post_json(

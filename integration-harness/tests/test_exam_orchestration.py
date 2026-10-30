@@ -101,7 +101,7 @@ def test_exam_errors_use_existing_relogin_and_stop_paths(monkeypatch, error):
     value.client = SimpleNamespace(post_exam_json=lambda *args: None)
     value.notifier = SimpleNamespace(send_markdown=lambda _: True)
     signals = []
-    value._signal_relogin = lambda: signals.append("relogin")
+    value._signal_relogin = lambda exc, context: signals.append("relogin")
     value._mark_account_stopped = signals.append
     monkeypatch.setattr("integration_harness.orchestrator.ExamStateStore", lambda *args: object())
 

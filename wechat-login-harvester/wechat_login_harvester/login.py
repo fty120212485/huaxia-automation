@@ -233,7 +233,10 @@ class LoginRunner:
                 continue
             if "v" in obs.text or "✓" in obs.text or "√" in obs.text:
                 return
-            x = obs.x - 35
+            # 复选框若被 OCR 合并进协议文本（本机新版：圆点“•/○”紧贴文本，
+            # 文本块左边缘即圆点左边缘，圆心在右侧约 15px）；否则退回旧布局
+            # （复选框独立在文本左侧约 35px）。两种布局都兼容。
+            x = obs.x + 15 if obs.text.lstrip().startswith(("•", "○")) else obs.x - 35
             y = obs.center[1]
             click_screen_point(
                 self._window.bounds.x + x / 2,

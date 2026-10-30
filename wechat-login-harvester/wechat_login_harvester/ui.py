@@ -83,27 +83,64 @@ def bring_wechat_frontmost() -> None:
     )
 
 
+def _save_scaled_image(image, path: Path, *, scale: int = 2) -> None:
+    """把窗口截图（1x）放大 scale 倍保存为 PNG，保持 Retina 坐标体系。"""
+    import Quartz
+
+    width = Quartz.CGImageGetWidth(image)
+    height = Quartz.CGImageGetHeight(image)
+    color_space = Quartz.CGColorSpaceCreateDeviceRGB()
+    context = Quartz.CGBitmapContextCreate(
+        None,
+        width * scale,
+        height * scale,
+        8,
+        width * scale * 4,
+        color_space,
+        Quartz.kCGImageAlphaNoneSkipLast | Quartz.kCGBitmapByteOrder32Little,
+    )
+    Quartz.CGContextSetInterpolationQuality(context, Quartz.kCGInterpolationHigh)
+    Quartz.CGContextDrawImage(
+        context,
+        Quartz.CGRectMake(0, 0, width * scale, height * scale),
+        image,
+    )
+    scaled = Quartz.CGBitmapContextCreateImage(context)
+
+    url = Quartz.NSURL.fileURLWithPath_(str(path))
+    destination = Quartz.CGImageDestinationCreateWithURL(url, "public.png", 1, None)
+    Quartz.CGImageDestinationAddImage(destination, scaled, None)
+    if not Quartz.CGImageDestinationFinalize(destination):
+        raise RuntimeError(f"屏幕截图写入失败：{path}")
+
+
 def capture_window(window: MiniProgramWindow, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    region = (
-        f"{window.bounds.x},{window.bounds.y},"
-        f"{window.bounds.width},{window.bounds.height}"
-    )
-    cmd = ["screencapture", "-x", "-R", region, str(path)]
+    import Quartz
+
+    # 按窗口 ID 截取窗口内容，而不是用 screencapture -R 截屏幕物理区域。
+    # 后者在窗口被其他窗口（终端/VSCode 等）遮挡时会截到遮挡窗口，
+    # 导致 OCR 识别错内容。窗口内容通常是 1x（逻辑分辨率），而本项目
+    # 按 Retina 2x 处理 OCR 坐标（login.py 点击时 /2），因此放大 2 倍。
+    image = None
     last_error = ""
     for _ in range(3):
-        try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            return path
-        except subprocess.CalledProcessError as exc:
-            last_error = (exc.stderr or "").strip() or str(exc)
-            time.sleep(1)
-    raise RuntimeError(f"屏幕截图失败：{last_error}")
+        image = Quartz.CGWindowListCreateImage(
+            Quartz.CGRectNull,
+            Quartz.kCGWindowListOptionIncludingWindow,
+            window.window_id,
+            Quartz.kCGWindowImageBoundsIgnoreFraming
+            | Quartz.kCGWindowImageBestResolution,
+        )
+        if image is not None:
+            break
+        last_error = f"窗口 {window.window_id} 不可读"
+        time.sleep(1)
+    if image is None:
+        raise RuntimeError(f"屏幕截图失败：{last_error}")
+
+    _save_scaled_image(image, path)
+    return path
 
 
 def recognize_text(path: Path) -> list[TextObservation]:

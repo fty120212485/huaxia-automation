@@ -302,7 +302,7 @@ class Orchestrator:
             return True
         except ApiError as exc:
             if exc.status_code == 401:
-                self._signal_relogin()
+                self._signal_relogin(exc, "考试接口")
             raise
         except ExamBlocked:
             self._mark_account_stopped("exam_blocked")
@@ -464,7 +464,7 @@ class Orchestrator:
             data = self.client.post_learn_json(path, payload)
         except ApiError as exc:
             if exc.status_code == 401:
-                self._signal_relogin()
+                self._signal_relogin(exc, f"POST {path}")
             raise
         summary = self._summarize(data)
         self._record(
@@ -1037,7 +1037,7 @@ class Orchestrator:
             )
         except ApiError as exc:
             if exc.status_code == 401:
-                self._signal_relogin()
+                self._signal_relogin(exc, "GET 视频分片")
             ok = self.notifier.send_video_download_failed(
                 app_id=self.config.app_id,
                 token_prefix=self.config.token_prefix,
@@ -1060,7 +1060,7 @@ class Orchestrator:
                 response_text=getattr(exc, "response_text", None),
             ) from exc
 
-    def _signal_relogin(self) -> None:
+    def _signal_relogin(self, exc: ApiError | None = None, context: str = "") -> None:
         # 401 时删除本地账户文件并同时写 stop，避免 watch 用旧 token 反复重启。
         config = getattr(self, "config", None)
         account_dir = getattr(config, "account_dir", None)
@@ -1090,11 +1090,45 @@ class Orchestrator:
                     key,
                     result.error,
                 )
+        detail = self._auth_failure_detail(exc, context)
         self.logger.info(
-            "视频返回 401，已删除本地账户文件并写入重新登录信号，30 秒后继续：%s",
+            "接口返回 401，已删除本地账户文件并写入重新登录信号，30 秒后继续：%s%s",
             self.id_card,
+            detail,
         )
         time.sleep(30)
+
+    @staticmethod
+    def _auth_failure_detail(exc: ApiError | None, context: str = "") -> str:
+        if exc is None:
+            return f"，服务端描述：{context}" if context else ""
+        status_code = getattr(exc, "status_code", None)
+        response_text = getattr(exc, "response_text", None)
+        message = ""
+        if response_text:
+            raw = str(response_text).strip()
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                message = raw
+            else:
+                if isinstance(payload, dict):
+                    message = str(
+                        payload.get("message")
+                        or payload.get("statusMessage")
+                        or ""
+                    ).strip() or raw
+                else:
+                    message = raw
+            message = message[:200]
+        parts: list[str] = []
+        if context:
+            parts.append(context)
+        if status_code is not None:
+            parts.append(f"HTTP {status_code}")
+        if message:
+            parts.append(message)
+        return f"，服务端描述：{' / '.join(parts)}" if parts else ""
 
     def _handle_qr_verification(
         self,

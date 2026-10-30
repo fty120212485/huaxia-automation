@@ -89,6 +89,7 @@ def _help_text() -> str:
         "恢复 身份证:440682198001010011\n"
         "恢复 身份证:440682198001010011,440682198210063620\n"
         "恢复学习+440682198001010011,440682198210063620\n"
+        "批量恢复 身份证:440682198001010011,440682198210063620\n"
         "停止所有\n"
         "恢复所有\n"
         "自动下一门 身份证:440682198001010011 开关:true\n"
@@ -103,6 +104,7 @@ def _help_text() -> str:
 def parse_command(text: str) -> ParsedCommand:
     """Parse a text message into a user-operation command."""
     normalized = _normalize(text)
+    normalized = re.sub(r"^批量恢复(?:学习)?(?=\s|$)", "恢复学习", normalized)
     lowered = normalized.lower()
 
     resume_list = re.fullmatch(

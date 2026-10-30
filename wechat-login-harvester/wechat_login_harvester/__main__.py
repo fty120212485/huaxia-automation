@@ -39,7 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="WeChat mini-program login UI automation and token capture"
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("login", help="Run UI login flow")
+    login_parser = sub.add_parser("login", help="Run UI login flow")
+    login_parser.add_argument(
+        "--user",
+        metavar="ID_CARD",
+        help="仅登录指定身份证号的用户（缺省登录全部未跳过用户）",
+    )
     sub.add_parser("capture", help="Start capture proxy")
     sub.add_parser("harvest", help="Start capture proxy and run login")
     sub.add_parser("reconcile", help="Reconcile user file with accounts/OSS")
@@ -180,8 +185,21 @@ def _stop_capture(proc: subprocess.Popen) -> None:
         proc.wait(timeout=15)
 
 
-def _command_login(config, notifier: WeChatNotifier | None) -> int:
+def _command_login(
+    config,
+    notifier: WeChatNotifier | None,
+    id_card: str | None = None,
+) -> int:
     active_users = [user for user in config.users if not user.skip]
+    if id_card:
+        target = id_card.strip().upper()
+        active_users = [u for u in active_users if u.id_card.upper() == target]
+        if not active_users:
+            print(
+                f"未找到身份证号 {id_card} 的有效用户（或该用户已被 skip）",
+                file=sys.stderr,
+            )
+            return 1
     for index, user in enumerate(active_users, 1):
         run_dir = Path.cwd() / "runs" / f"{_session_id()}-{index:02d}"
         try:
@@ -429,9 +447,21 @@ def _list_account_ids(oss) -> list[str]:
     return ids
 
 
+def _account_device_id(account_path: Path) -> str:
+    try:
+        payload = json.loads(account_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("deviceId") or payload.get("device_id") or "")
+
+
 def _relogin_user(config, user, notifier) -> bool:
     account_path = config.account_dir / f"{user.id_card}.account"
-    before = account_path.stat().st_mtime if account_path.exists() else 0.0
+    before_device = (
+        _account_device_id(account_path) if account_path.exists() else ""
+    )
     try:
         _harvest_users(config, [user], notifier)
     except Exception as exc:
@@ -440,8 +470,18 @@ def _relogin_user(config, user, notifier) -> bool:
             "重新登录执行失败",
             details={**_user_details(user), "异常": f"{type(exc).__name__}: {exc}"},
         )
-    after = account_path.stat().st_mtime if account_path.exists() else 0.0
-    return after > before
+    if not account_path.exists():
+        return False
+    after_device = _account_device_id(account_path)
+    changed = bool(after_device) and after_device != before_device
+    if not changed:
+        logger.warning(
+            "重新登录后 deviceId 未更新（旧=%r 新=%r），401 可能复现：%s",
+            before_device,
+            after_device,
+            user.id_card,
+        )
+    return changed
 
 
 def _poll_relogin_signals(config, oss, notifier) -> None:
@@ -632,7 +672,7 @@ def main() -> int:
     notifier = _make_notifier(config)
     try:
         if args.command == "login":
-            return _command_login(config, notifier)
+            return _command_login(config, notifier, args.user)
         if args.command == "capture":
             return _command_capture(config, notifier)
         if args.command == "harvest":

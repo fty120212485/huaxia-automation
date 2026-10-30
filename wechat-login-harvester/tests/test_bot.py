@@ -179,6 +179,8 @@ def test_stop_command_rejects_unknown_user(tmp_path):
 
 @pytest.mark.parametrize("text", [
     "恢复学习 + id-1， id-2,id-1",
+    "批量恢复 身份证:id-1, id-2,id-1",
+    "批量恢复学习 身份证:id-1,id-2",
     "恢复 身份证：id-1,id-2,id-1",
     "恢复 身份证：id-1， id-2,\nid-1",
 ])
