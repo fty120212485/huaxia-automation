@@ -228,12 +228,13 @@ class LoginRunner:
 
     def _ensure_agreement_checked(self, window: MiniProgramWindow) -> None:
         path = self._snapshot(window, "check-agreement")
-        for obs in recognize_text(path):
+        observations = recognize_text(path)
+        for obs in observations:
             if "我已认真阅读" not in obs.text:
                 continue
             if "v" in obs.text or "✓" in obs.text or "√" in obs.text:
                 return
-            x = obs.x - 35
+            x = self._agreement_checkbox_x(obs, observations)
             y = obs.center[1]
             click_screen_point(
                 self._window.bounds.x + x / 2,
@@ -241,6 +242,24 @@ class LoginRunner:
             )
             time.sleep(0.5)
             return
+
+    @staticmethod
+    def _agreement_checkbox_x(agreement, observations) -> float:
+        # 复选框若被 OCR 合并进协议文本（圆点紧贴文本），圆心在文本左缘右侧约 15px。
+        text = agreement.text.lstrip()
+        if text.startswith(("•", "○", "〇")):
+            return agreement.x + 15
+        # 复选框独立成块时，点该符号块中心（限协议文本左侧、垂直对齐）。
+        for obs in observations:
+            if obs.text.strip() not in {"•", "○", "〇", "✓", "√", "✔"}:
+                continue
+            if (
+                obs.x < agreement.x
+                and abs(obs.center[1] - agreement.center[1]) <= agreement.height
+            ):
+                return obs.center[0]
+        # 兜底：旧布局，复选框独立在文本左侧约 35px。
+        return agreement.x - 35
 
     def _accept_privacy_popup(self, window: MiniProgramWindow) -> None:
         deadline = time.monotonic() + 8
