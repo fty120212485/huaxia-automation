@@ -743,24 +743,17 @@ class Orchestrator:
         course_detail: dict[str, Any],
         doc_id: str,
     ) -> int:
-        learned = (
-            course_detail.get("data", {})
-            .get("mycourseInfo", {})
-            .get("learned")
-            or {}
-        )
-        doc_state = learned.get(doc_id) or {}
-        for key in ("learnedTime", "lastTime"):
-            value = doc_state.get(key)
-            if value is None:
-                continue
-            try:
-                value_int = int(value)
-            except (TypeError, ValueError):
-                value_int = 0
-            if value_int > 0:
-                return value_int
-        return 0
+        data = course_detail.get("data", {})
+        # startTime is the server's playback position; learnedTime is historical
+        # credit and can equal duration even when this visit starts at zero.
+        value = (data.get("docInfo") or {}).get("startTime")
+        if value is None:
+            learned = (data.get("mycourseInfo") or {}).get("learned") or {}
+            value = (learned.get(doc_id) or {}).get("lastTime", 0)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
     def _resolve_current_doc_id(
         self,

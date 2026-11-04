@@ -392,7 +392,7 @@ def test_find_target_seconds_falls_back_to_doc_duration():
     assert Orchestrator._find_target_seconds(None, course_detail, "doc-id") == 888
 
 
-def test_find_learned_seconds_prefers_learned_time():
+def test_find_learned_seconds_does_not_use_historical_credit():
     course_detail = {
         "data": {
             "mycourseInfo": {
@@ -403,7 +403,7 @@ def test_find_learned_seconds_prefers_learned_time():
         }
     }
 
-    assert Orchestrator._find_learned_seconds(None, course_detail, "doc-id") == 2561
+    assert Orchestrator._find_learned_seconds(None, course_detail, "doc-id") == 0
 
 
 def test_find_learned_seconds_falls_back_to_last_time_and_zero():
@@ -847,3 +847,11 @@ def test_run_processes_all_tasks_sequentially():
     orchestrator.run()
 
     assert processed == ["task-1", "task-2"]
+
+
+@pytest.mark.parametrize("start, expected", [(0, 0), (63, 63), ("122", 122), (-1, 0)])
+def test_playback_position_uses_server_start_time(start, expected):
+    detail = {"data": {"docInfo": {"startTime": start}, "mycourseInfo": {
+        "learned": {"doc": {"learnedTime": 1112, "lastTime": 99}}
+    }}}
+    assert Orchestrator._find_learned_seconds(None, detail, "doc") == expected
