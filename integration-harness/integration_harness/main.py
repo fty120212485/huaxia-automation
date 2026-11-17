@@ -501,6 +501,22 @@ def _ensure_account_file(
     return account_path
 
 
+def _discover_storage_accounts(uploader, account_dir: Path, storage_mode: str) -> set[str]:
+    prefixes = uploader.list_prefixes("hxacc/account/")
+    identifiers = {
+        prefix.rstrip("/").rsplit("/", 1)[-1]
+        for prefix in prefixes
+        if prefix.rstrip("/").startswith("hxacc/account/")
+    }
+    if storage_mode != "Local":
+        return identifiers
+    # Authentication profiles and unrelated folders are not learning accounts.
+    # Do not impose mainland-only ID validation: Hong Kong documents are valid.
+    return {ident for ident in identifiers
+            if (account_dir / f"{ident}.account").is_file()
+            or uploader.object_exists(f"hxacc/account/{ident}/{ident}.account")}
+
+
 def _account_slot(id_card: str, slot_count: int) -> int:
     digest = hashlib.sha256(id_card.encode("utf-8")).hexdigest()
     return int(digest, 16) % slot_count
@@ -592,6 +608,7 @@ def _watch_accounts(account_dir: Path) -> int:
     finished_notified: set[str] = set()
     stop_notified: set[str] = set()
     expired_notified: set[str] = set()
+    missing_account_notified: set[str] = set()
     process_ttl_seconds = int(os.getenv("PROCESS_LEASE_SECONDS", "120"))
     last_renew: dict[str, float] = {}
     status_reads = ReadCache()
@@ -782,12 +799,7 @@ def _watch_accounts(account_dir: Path) -> int:
                     stop_all()
                     last_global_auto_next = current_global_auto_next
 
-                prefixes = uploader.list_prefixes("hxacc/account/")
-                current_ids = {
-                    prefix.rstrip("/").rsplit("/", 1)[-1]
-                    for prefix in prefixes
-                    if prefix.rstrip("/").startswith("hxacc/account/")
-                }
+                current_ids = _discover_storage_accounts(uploader, account_dir, storage_name)
 
                 for id_card in sorted(current_ids):
                     slot = _account_slot(id_card, slot_count)
@@ -860,12 +872,15 @@ def _watch_accounts(account_dir: Path) -> int:
                         uploader, account_dir, id_card
                     )
                     if account_path is None:
-                        print(
-                            f"账户文件不存在且 {storage_name} 无副本："
-                            f"{account_dir / f'{id_card}.account'}",
-                            file=sys.stderr,
-                        )
+                        if id_card not in missing_account_notified:
+                            print(
+                                f"账户文件不存在且 {storage_name} 无副本："
+                                f"{account_dir / f'{id_card}.account'}（恢复文件前不重复提示）",
+                                file=sys.stderr,
+                            )
+                            missing_account_notified.add(id_card)
                         continue
+                    missing_account_notified.discard(id_card)
 
                     signature = _file_sha256(account_path)
                     if (

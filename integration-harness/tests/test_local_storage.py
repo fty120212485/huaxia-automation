@@ -54,3 +54,20 @@ def test_oss_mode_preserves_factory_contract():
     def factory(**kw):calls.append(kw);return expected
     assert make_storage(cfg,oss_factory=factory) is expected
     assert calls[0]['bucket_name']=='b'
+
+
+def test_discovery_ignores_auth_only_and_unrelated_directories(tmp_path):
+    from integration_harness.main import _discover_storage_accounts
+    shared=root(tmp_path)
+    adapter=LocalAccountUploader(shared)
+    for ident in ["auth-only", "未命名文件夹", "'429001198409298228"]:
+        adapter.upload_text(f'hxacc/account/{ident}/account.json','{}')
+    adapter.upload_text('hxacc/account/canonical/canonical.account','{}')
+    adapter.upload_text('hxacc/account/Z00000000/account.json','{}')
+    credentials=shared/'credentials';credentials.mkdir()
+    (credentials/'Z00000000.account').write_text('{}')
+    assert _discover_storage_accounts(adapter,credentials,'Local')=={'canonical','Z00000000'}
+    assert 'auth-only' in _discover_storage_accounts(adapter,credentials,'OSS')
+    # A later login creates real learning credentials and is discoverable next scan.
+    adapter.upload_text('hxacc/account/auth-only/auth-only.account','{}')
+    assert 'auth-only' in _discover_storage_accounts(adapter,credentials,'Local')
