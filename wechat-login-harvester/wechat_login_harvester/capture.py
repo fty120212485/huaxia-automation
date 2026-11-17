@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -134,10 +136,14 @@ class LoginCaptureAddon:
             "name": login_data.get("name", ""),
             "tokenExpiresAt": _jwt_expiry(login_data.get("token", "")),
         }
-        path.write_text(
-            json.dumps(account_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        fd, temporary = tempfile.mkstemp(prefix=".account-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(account_payload, stream, ensure_ascii=False, indent=2)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def _upload_account_file(self, path: Path, id_card: str) -> None:
         if self.oss_client is None:

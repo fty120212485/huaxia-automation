@@ -8,6 +8,7 @@ import re
 import ssl
 import threading
 import uuid
+from functools import wraps
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -285,12 +286,24 @@ def parse_command(text: str) -> ParsedCommand:
     return ParsedCommand(action="help")
 
 
+_USER_STORE_LOCK = threading.RLock()
+
+
+def _store_locked(method):
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        with _USER_STORE_LOCK:
+            return method(*args, **kwargs)
+    return wrapped
+
+
 class UserStore:
     """Read and atomically update the ``user`` JSON file."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
+    @_store_locked
     def read(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
@@ -312,6 +325,7 @@ class UserStore:
                 result.append({"id_card": str(item)})
         return result
 
+    @_store_locked
     def write(self, users: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
@@ -321,6 +335,7 @@ class UserStore:
         )
         os.replace(tmp, self.path)
 
+    @_store_locked
     def add(self, values: dict[str, Any]) -> dict[str, Any]:
         users = self.read()
         if any(str(u.get("id_card", "")).strip() == values["id_card"] for u in users):
@@ -330,6 +345,22 @@ class UserStore:
         self.write(users)
         return item
 
+    @_store_locked
+    def add_many_new(self, candidates: list[dict[str, Any]]) -> int:
+        """Append only new IDs; preserve local names, skip flags, and all metadata."""
+        users = self.read()
+        known = {str(u.get("id_card", "")).strip().upper() for u in users}
+        added = []
+        for item in candidates:
+            key = str(item["id_card"]).strip().upper()
+            if key not in known:
+                known.add(key)
+                added.append(dict(item))
+        if added:
+            self.write(users + added)
+        return len(added)
+
+    @_store_locked
     def delete(self, id_card: str) -> dict[str, Any] | None:
         users = self.read()
         remaining = [u for u in users if str(u.get("id_card", "")).strip() != id_card]
@@ -341,6 +372,7 @@ class UserStore:
             self.write(remaining)
         return removed
 
+    @_store_locked
     def update(self, id_card: str, values: dict[str, Any]) -> dict[str, Any] | None:
         users = self.read()
         target = next(

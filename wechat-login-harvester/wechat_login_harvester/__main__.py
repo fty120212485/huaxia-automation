@@ -16,6 +16,7 @@ from .bot import UserStore, start_bot_thread
 from .config import load_config
 from .login import LoginRunner
 from .oss import OssClient
+from .storage import make_storage, enabled as storage_enabled
 from .reconcile import reconcile
 from .wechat import WeChatNotifier
 from .oss_runtime import STATS, seconds
@@ -45,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ID_CARD",
         help="仅登录指定身份证号的用户（缺省登录全部未跳过用户）",
     )
+    web_parser = sub.add_parser("web-login", help="使用官网接口和本地 OCR 登录")
+    web_parser.add_argument("--user", required=True, metavar="ID_CARD")
+    for command in ("kdocs-login", "kdocs-check", "kdocs-sync"):
+        kparser = sub.add_parser(command, help="金山专用会话登录／只读检查／新增账号")
+        kparser.add_argument("--url", help="金山表格分享链接（覆盖 KDOCS_URL）")
     sub.add_parser("capture", help="Start capture proxy")
     sub.add_parser("harvest", help="Start capture proxy and run login")
     sub.add_parser("reconcile", help="Reconcile user file with accounts/OSS")
@@ -271,12 +277,7 @@ def _upload_account_artifacts(
 ) -> bool:
     if not account_path.exists():
         return False
-    oss = OssClient(
-        access_key_id=config.oss_access_key_id,
-        access_key_secret=config.oss_access_key_secret,
-        bucket_name=config.oss_bucket,
-        endpoint=config.oss_endpoint,
-    )
+    oss = make_storage(config)
     prefix = f"hxacc/account/{user.id_card}"
     account_key = f"{prefix}/{account_path.name}"
     manifest_key = f"{prefix}/account.json"
@@ -292,6 +293,8 @@ def _upload_account_artifacts(
 
 
 def _harvest_users(config, users, notifier: WeChatNotifier | None) -> int:
+    if getattr(config, "login_backend", "ui") == "web":
+        return _web_harvest_users(config, users, notifier)
     config.token_output_dir.mkdir(parents=True, exist_ok=True)
     capture_run_dir = Path.cwd() / "runs" / _session_id()
     try:
@@ -384,6 +387,26 @@ def _harvest_users(config, users, notifier: WeChatNotifier | None) -> int:
     return 0
 
 
+def _web_harvest_users(config, users, notifier) -> int:
+    from .web_login import WebLoginRunner
+
+    failed = False
+    for user in users:
+        try:
+            path = WebLoginRunner(config).run(user)
+            if storage_enabled(config):
+                _upload_account_artifacts(config, user, path)
+            print(f"接口登录成功：{user.name}")
+        except Exception as exc:
+            failed = True
+            # Transport exceptions can include sensitive request details. Keep those private.
+            from .web_login import WebLoginError
+            reason = str(exc) if isinstance(exc, WebLoginError) else type(exc).__name__
+            _notify_failure(notifier, "接口登录失败", details={"姓名": user.name, "原因": reason})
+            print(f"接口登录失败：{user.name}，{reason}", file=sys.stderr)
+    return 1 if failed else 0
+
+
 def _command_harvest(config, notifier: WeChatNotifier | None) -> int:
     active_users = [user for user in config.users if not user.skip]
     if not active_users:
@@ -463,15 +486,21 @@ def _relogin_user(config, user, notifier) -> bool:
         _account_device_id(account_path) if account_path.exists() else ""
     )
     try:
-        _harvest_users(config, [user], notifier)
+        if _harvest_users(config, [user], notifier) != 0:
+            return False
     except Exception as exc:
         _notify_failure(
             notifier,
             "重新登录执行失败",
             details={**_user_details(user), "异常": f"{type(exc).__name__}: {exc}"},
         )
+        return False
     if not account_path.exists():
         return False
+    if getattr(config, "login_backend", "ui") == "web":
+        # Website sessions intentionally retain a stable device ID. A verified new
+        # login/upload, rather than a changed device, determines success.
+        return True
     after_device = _account_device_id(account_path)
     changed = bool(after_device) and after_device != before_device
     if not changed:
@@ -565,12 +594,17 @@ def _command_watch(config, notifier: WeChatNotifier | None) -> int:
         )
 
     last_hash = _user_file_hash(config)
+    kdocs_thread = None
+    if getattr(config, "kdocs_url", ""):
+        from .kdocs import start_kdocs_thread
+        kdocs_thread = start_kdocs_thread(config, stop_event, notifier)
+        print("已启用金山表格新账号检测：跳过认证完成／已同步／已删除的记录")
     last_relogin_poll: float | None = None
     relogin_interval = seconds("RELOGIN_POLL_INTERVAL_SECONDS", 15)
     print(f"开始监控 {config.user_file}，间隔 {config.watch_interval_seconds}s")
     print(
-        f"OSS 登录信号检查间隔 {relogin_interval}s，"
-        f"目录缓存 {seconds('OSS_DIRECTORY_CACHE_SECONDS', 60)}s"
+        f"{getattr(config, 'storage_mode', 'OSS')} 登录信号检查间隔 {relogin_interval}s，"
+        f"目录缓存 {0 if getattr(config, 'storage_mode', 'OSS') == 'Local' else seconds('OSS_DIRECTORY_CACHE_SECONDS', 60)}s"
     )
     try:
         while True:
@@ -593,6 +627,13 @@ def _command_watch(config, notifier: WeChatNotifier | None) -> int:
             new_hash = _user_file_hash(new_config)
             if new_hash == last_hash:
                 continue
+            # The sheet worker/bot may have updated the file after load_config().
+            try:
+                new_config = load_config()
+            except Exception:
+                continue
+            if _user_file_hash(new_config) != new_hash:
+                continue
             last_hash = new_hash
             result = reconcile(new_config)
             _print_reconcile_result(result, notifier)
@@ -604,6 +645,44 @@ def _command_watch(config, notifier: WeChatNotifier | None) -> int:
         stop_event.set()
         if bot_thread is not None:
             bot_thread.join(timeout=3)
+        if kdocs_thread is not None:
+            kdocs_thread.join(timeout=3)
+
+
+def _command_kdocs(config, command, url=None) -> int:
+    from dataclasses import replace
+    from .kdocs import KdocsReader, NewAccountDetector, state_path
+    if url:
+        config = replace(config, kdocs_url=url)
+    if not config.kdocs_url:
+        print("请设置 KDOCS_URL 或传入 --url", file=sys.stderr)
+        return 1
+    with KdocsReader(config, headed=command == "kdocs-login") as reader:
+        if command == "kdocs-login":
+            print("请在专用 Chrome 窗口中登录金山文档；验证读取成功后自动保存并退出。", flush=True)
+            deadline = time.monotonic() + 600
+            while True:
+                try:
+                    snapshot = reader.snapshot()
+                    break
+                except Exception:
+                    if time.monotonic() >= deadline:
+                        print("十分钟内未完成读取验证，请重新运行 kdocs-login", file=sys.stderr)
+                        return 1
+                    # Playwright must continue processing browser events during login.
+                    reader.page.wait_for_timeout(3000)
+        else:
+            snapshot = reader.snapshot()
+        existing = {str(x.get("id_card", "")).strip().upper() for x in UserStore(config.user_file).read()}
+        new_count = sum(x["id_card"].upper() not in existing for x in snapshot.candidates)
+        print(f"读取成功：状态跳过 {snapshot.blocked} 行，不完整／不安全 {snapshot.incomplete} 行，冲突 {snapshot.conflicts} 行，待新增 {new_count} 个")
+        if command == "kdocs-sync":
+            detector = NewAccountDetector(UserStore(config.user_file), state_path(config))
+            detector.observe(snapshot)
+            reader.page.wait_for_timeout(int(config.kdocs_poll_seconds * 1000))
+            added = detector.observe(reader.snapshot())
+            print(f"已新增 {added} 个账号到 user 文件；后续由现有监控流程处理")
+    return 0
 
 
 def _command_bot(config, notifier: WeChatNotifier | None) -> int:
@@ -635,14 +714,9 @@ def _command_bot(config, notifier: WeChatNotifier | None) -> int:
 
 
 def _make_oss_client(config):
-    if not (config.oss_bucket and config.oss_access_key_id and config.oss_access_key_secret):
+    if not storage_enabled(config):
         return None
-    return OssClient(
-        access_key_id=config.oss_access_key_id,
-        access_key_secret=config.oss_access_key_secret,
-        bucket_name=config.oss_bucket,
-        endpoint=config.oss_endpoint,
-    )
+    return make_storage(config)
 
 
 def main() -> int:
@@ -654,8 +728,13 @@ def main() -> int:
     # oss2 会把每个 HTTP 错误（含预期的 404 NoSuchKey）以 INFO 打到 oss2.api，
     # 这里只保留 WARNING 及以上，避免刷屏；真正的错误仍会通过异常/我们自己的日志暴露。
     logging.getLogger("oss2.api").setLevel(logging.WARNING)
+    # Signed document export URLs contain temporary access credentials.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         config = load_config()
+        if getattr(config, "storage_mode", "OSS") == "Local":
+            # Validate the selected root before a login can refresh credentials.
+            make_storage(config)
     except Exception as exc:
         notifier = WeChatNotifier(
             os.getenv("WECOM_WEBHOOK_URL", DEFAULT_WECOM_WEBHOOK_URL),
@@ -671,8 +750,24 @@ def main() -> int:
 
     notifier = _make_notifier(config)
     try:
+        if args.command.startswith("kdocs-"):
+            return _command_kdocs(config, args.command, args.url)
         if args.command == "login":
+            if config.login_backend == "web":
+                users = [u for u in config.users if not u.skip and
+                         (not args.user or u.id_card.upper() == args.user.strip().upper())]
+                if not users:
+                    print("未找到有效用户", file=sys.stderr)
+                    return 1
+                return _web_harvest_users(config, users, notifier)
             return _command_login(config, notifier, args.user)
+        if args.command == "web-login":
+            users = [u for u in config.users if not u.skip and
+                     u.id_card.upper() == args.user.strip().upper()]
+            if not users:
+                print("未找到有效用户", file=sys.stderr)
+                return 1
+            return _web_harvest_users(config, users, notifier)
         if args.command == "capture":
             return _command_capture(config, notifier)
         if args.command == "harvest":

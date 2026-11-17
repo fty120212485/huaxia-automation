@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .config import Config, UserCredential
 from .oss import OssClient, OssDeleteResult
+from .storage import make_storage, enabled as storage_enabled
 
 
 @dataclass(frozen=True)
@@ -42,14 +43,9 @@ def reconcile(config: Config) -> ReconcileResult:
             deleted_local.append(user.id_card)
 
     oss_results: list[OssDeleteResult] = []
-    if skipped and config.oss_bucket and config.oss_access_key_id and config.oss_access_key_secret:
+    if skipped and storage_enabled(config):
         try:
-            oss = OssClient(
-                access_key_id=config.oss_access_key_id,
-                access_key_secret=config.oss_access_key_secret,
-                bucket_name=config.oss_bucket,
-                endpoint=config.oss_endpoint,
-            )
+            oss = make_storage(config)
             for user in skipped:
                 oss_results.append(
                     oss.delete_prefix(f"hxacc/account/{user.id_card}/")

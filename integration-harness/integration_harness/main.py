@@ -18,6 +18,7 @@ from .accounts import Account, AccountLoadError, load_account_file, load_account
 from .client import ApiError, HxaccClient
 from .config import Config, load_config
 from .oss_upload import OssAccountUploader
+from .object_storage import make_storage
 from .oss_runtime import ReadCache, STATS, seconds
 from .orchestrator import Orchestrator, _TaskCompletedAwaitResume
 from .storage import RunStore
@@ -572,6 +573,8 @@ def _watch_accounts(account_dir: Path) -> int:
             "HXACC_DEVICE_ID": "watch-mode",
         }
     )
+    if getattr(config, "storage_mode", "OSS") == "Local":
+        account_dir = config.account_dir
     interval = float(os.getenv("ACCOUNT_WATCH_INTERVAL_SECONDS", "2"))
     slot_count = int(os.getenv("ACCOUNT_SLOT_COUNT", "16"))
     worker_id = os.getenv("WORKER_ID", "device-01")
@@ -581,12 +584,7 @@ def _watch_accounts(account_dir: Path) -> int:
         config.wecom_webhook_url,
         outbox_path=config.runs_dir / ".wecom_outbox.jsonl",
     )
-    uploader = OssAccountUploader(
-        access_key_id=config.oss_access_key_id,
-        access_key_secret=config.oss_access_key_secret,
-        bucket_name=config.oss_bucket,
-        endpoint=config.oss_endpoint,
-    )
+    uploader = make_storage(config, oss_factory=OssAccountUploader)
     log_dir = _project_root() / "runs" / "watch"
     log_dir.mkdir(parents=True, exist_ok=True)
     watched: dict[str, tuple[subprocess.Popen, object, object]] = {}
@@ -601,9 +599,13 @@ def _watch_accounts(account_dir: Path) -> int:
     stop_interval = seconds("OSS_STOP_POLL_SECONDS", 10)
     status_interval = seconds("OSS_STATUS_POLL_SECONDS", 60)
     worker_interval = seconds("OSS_WORKERS_CACHE_SECONDS", 60)
+    if getattr(config, "storage_mode", "OSS") == "Local":
+        stop_interval = status_interval = worker_interval = 0.0
+
     global_env_path = _project_root() / ".env"
     last_global_auto_next = getattr(config, "auto_next_course", False)
-    print(f"开始监控 OSS hxacc/account/，本地账户目录 {account_dir}，扫描间隔 {interval}s")
+    storage_name = getattr(config, "storage_mode", "OSS")
+    print(f"开始监控 {storage_name} hxacc/account/，账户目录 {account_dir}，扫描间隔 {interval}s")
     print(
         f"OSS 缓存：停止 {stop_interval}s，完成/每日上限 {status_interval}s，"
         f"节点 {worker_interval}s，目录 {seconds('OSS_DIRECTORY_CACHE_SECONDS', 60)}s"
@@ -673,7 +675,11 @@ def _watch_accounts(account_dir: Path) -> int:
         return True
 
     def create_process_file(id_card: str) -> bool:
+        if getattr(config, "storage_mode", "OSS") == "Local" and not uploader.acquire_account_lock(id_card):
+            return False
         ok = write_process_file(id_card)
+        if not ok and getattr(config, "storage_mode", "OSS") == "Local":
+            uploader.release_account_lock(id_card)
         if ok:
             print(f"已创建进程标记：{process_key(id_card)}")
         return ok
@@ -711,9 +717,9 @@ def _watch_accounts(account_dir: Path) -> int:
 
     def stop_all() -> None:
         for path, (proc, stdout_file, stderr_file) in list(watched.items()):
+            _stop_watched_process(proc, stdout_file, stderr_file)
             delete_process_file(path)
             last_renew.pop(path, None)
-            _stop_watched_process(proc, stdout_file, stderr_file)
             print(f"已停止：{path}")
         watched.clear()
 
@@ -721,9 +727,9 @@ def _watch_accounts(account_dir: Path) -> int:
         if id_card not in watched:
             return
         proc, stdout_file, stderr_file = watched.pop(id_card)
+        _stop_watched_process(proc, stdout_file, stderr_file)
         delete_process_file(id_card)
         last_renew.pop(id_card, None)
-        _stop_watched_process(proc, stdout_file, stderr_file)
         print(f"已停止：{id_card}")
 
     def start_one(id_card: str, account_path: Path) -> None:
@@ -855,7 +861,7 @@ def _watch_accounts(account_dir: Path) -> int:
                     )
                     if account_path is None:
                         print(
-                            f"本地账户文件不存在且 OSS 无副本："
+                            f"账户文件不存在且 {storage_name} 无副本："
                             f"{account_dir / f'{id_card}.account'}",
                             file=sys.stderr,
                         )
@@ -921,14 +927,14 @@ def _watch_accounts(account_dir: Path) -> int:
             except Exception as exc:
                 consecutive_oss_failures += 1
                 print(
-                    f"OSS 扫描失败，等待后重试：{type(exc).__name__}: {exc}",
+                    f"{storage_name} 扫描失败，等待后重试：{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
                 if consecutive_oss_failures >= 3:
                     notifier.send_markdown(
                         "\n".join(
                             [
-                                "⚠️ OSS 扫描连续失败",
+                                f"⚠️ {storage_name} 扫描连续失败",
                                 f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
                                 f"连续失败次数：{consecutive_oss_failures}",
                                 f"最后异常：{type(exc).__name__}: {exc}",
@@ -963,6 +969,9 @@ def _watch_accounts(account_dir: Path) -> int:
         stop_all()
         return 0
     finally:
+        if getattr(config, "storage_mode", "OSS") == "Local":
+            stop_all()
+            uploader.close()
         STATS.flush(force=True)
         notifier.close()
 
@@ -1013,12 +1022,7 @@ def _prepare_accounts(accounts: list[Account]) -> tuple[list[_PreparedAccount], 
             outbox_path=config.runs_dir / ".wecom_outbox.jsonl",
         )
         notifier.flush_outbox()
-        uploader = OssAccountUploader(
-            access_key_id=config.oss_access_key_id,
-            access_key_secret=config.oss_access_key_secret,
-            bucket_name=config.oss_bucket,
-            endpoint=config.oss_endpoint,
-        )
+        uploader = make_storage(config, oss_factory=OssAccountUploader)
         prepared.append(
             _PreparedAccount(
                 account=account,
@@ -1039,12 +1043,7 @@ def _resume_account(id_card: str) -> int:
             "HXACC_DEVICE_ID": "resume-mode",
         }
     )
-    uploader = OssAccountUploader(
-        access_key_id=config.oss_access_key_id,
-        access_key_secret=config.oss_access_key_secret,
-        bucket_name=config.oss_bucket,
-        endpoint=config.oss_endpoint,
-    )
+    uploader = make_storage(config, oss_factory=OssAccountUploader)
     stop_key = f"hxacc/account/{id_card}/stop"
     limit_key = _daily_limit_key(id_card)
     marker_keys = [
@@ -1081,12 +1080,7 @@ def _workers_command(args) -> int:
             "HXACC_DEVICE_ID": "workers-mode",
         }
     )
-    uploader = OssAccountUploader(
-        access_key_id=config.oss_access_key_id,
-        access_key_secret=config.oss_access_key_secret,
-        bucket_name=config.oss_bucket,
-        endpoint=config.oss_endpoint,
-    )
+    uploader = make_storage(config, oss_factory=OssAccountUploader)
     current = _oss_worker_ids(uploader) or []
     if args.list:
         if current:
@@ -1155,7 +1149,9 @@ def main() -> int:
             return 0
     else:
         try:
-            accounts = load_accounts(Path(args.account_dir).expanduser())
+            base_config = load_config({"HXACC_TOKEN": "load-mode", "HXACC_DEVICE_ID": "load-mode"})
+            directory = base_config.account_dir if getattr(base_config, "storage_mode", "OSS") == "Local" else Path(args.account_dir).expanduser()
+            accounts = load_accounts(directory)
         except AccountLoadError as exc:
             print(str(exc), file=sys.stderr)
             notifier = WeChatNotifier(DEFAULT_WECOM_WEBHOOK_URL)

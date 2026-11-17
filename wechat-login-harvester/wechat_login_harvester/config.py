@@ -31,6 +31,15 @@ class Config:
     wecom_bot_id: str = ""
     wecom_bot_secret: str = ""
     login_logout_delay_seconds: float = 30.0
+    login_backend: str = "ui"
+    web_login_base_url: str = "https://guangdong.hxacc.com"
+    web_login_ca_file: str = ""
+    kdocs_url: str = ""
+    kdocs_profile_dir: Path = Path("runs/kdocs-browser")
+    kdocs_sheet: str = ""
+    kdocs_poll_seconds: float = 5.0
+    storage_mode: str = "OSS"
+    shared_root: Path = Path("/Users/fty/共享/hxacc")
 
 
 def _load_dotenv(path: Path) -> None:
@@ -49,6 +58,13 @@ def _load_dotenv(path: Path) -> None:
 
 def load_config() -> Config:
     _load_dotenv(Path(".env"))
+    mode = os.getenv("STORAGE_MODE", "OSS").strip().lower()
+    if mode not in {"oss", "local"}:
+        raise RuntimeError("STORAGE_MODE 必须是 OSS 或 Local")
+    shared_root = Path(os.getenv("SHARED_ROOT", "/Users/fty/共享/hxacc")).expanduser().resolve()
+    backend = os.getenv("LOGIN_BACKEND", "ui").strip().lower()
+    if backend not in {"ui", "web"}:
+        raise RuntimeError("LOGIN_BACKEND 必须是 ui 或 web")
     user_file = Path(
         os.getenv(
             "USER_FILE",
@@ -106,12 +122,23 @@ def load_config() -> Config:
     ).expanduser()
     if not account_dir.is_absolute():
         account_dir = Path.cwd() / account_dir
+    if mode == "local":
+        account_dir = shared_root / "credentials"
 
     output_dir = Path(os.getenv("TOKEN_OUTPUT_DIR", "runs/tokens"))
     if not output_dir.is_absolute():
         output_dir = Path.cwd() / output_dir
 
     return Config(
+        storage_mode="Local" if mode == "local" else "OSS",
+        shared_root=shared_root,
+        kdocs_url=os.getenv("KDOCS_URL", "").strip(),
+        kdocs_profile_dir=Path(os.getenv("KDOCS_PROFILE_DIR", "runs/kdocs-browser")).expanduser().resolve(),
+        kdocs_sheet=os.getenv("KDOCS_SHEET", "").strip(),
+        kdocs_poll_seconds=max(5.0, float(os.getenv("KDOCS_POLL_SECONDS", "5"))),
+        login_backend=backend,
+        web_login_base_url=os.getenv("WEB_LOGIN_BASE_URL", "https://guangdong.hxacc.com").rstrip("/"),
+        web_login_ca_file=os.getenv("WEB_LOGIN_CA_FILE", "").strip(),
         users=tuple(users),
         user_file=user_file,
         account_dir=account_dir,

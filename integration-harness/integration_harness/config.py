@@ -43,6 +43,9 @@ class Config:
     llm_max_tokens: int = 8192
     llm_max_tokens_limit: int = 32768
 
+    storage_mode: str = "OSS"
+    shared_root: Path = Path("/Users/fty/共享/hxacc")
+
     @property
     def token_prefix(self) -> str:
         if not self.token:
@@ -69,6 +72,11 @@ def load_config(overrides: dict[str, str] | None = None) -> Config:
     values = dict(os.environ)
     if overrides:
         values.update(overrides)
+
+    mode = values.get("STORAGE_MODE", "OSS").strip().lower()
+    if mode not in {"oss", "local"}:
+        raise RuntimeError("STORAGE_MODE 必须是 OSS 或 Local")
+    shared_root = Path(values.get("SHARED_ROOT", "/Users/fty/共享/hxacc")).expanduser().resolve()
 
     token = values.get("HXACC_TOKEN", "").strip()
     if not token:
@@ -97,7 +105,12 @@ def load_config(overrides: dict[str, str] | None = None) -> Config:
     if not account_dir.is_absolute():
         account_dir = Path.cwd() / account_dir
 
+    if mode == "local":
+        account_dir = shared_root / "credentials"
+
     return Config(
+        storage_mode="Local" if mode == "local" else "OSS",
+        shared_root=shared_root,
         token=token,
         device_id=device_id,
         www_base_url=values.get("WWW_BASE_URL", "https://www.hxacc.com").rstrip("/"),
